@@ -17,3 +17,6 @@ vue前端
 When generating structured output, never translate enum values.
 Always preserve exact schema literals such as "allow" and "deny".
 非审查模型默认语言使用中文。
+
+## 信息传递范式
+1. 每次任务后，如果你创建了新文件或者删除了旧文件，需要在最终聊天告知我文件路径和含义

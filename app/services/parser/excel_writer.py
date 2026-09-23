@@ -35,6 +35,17 @@ def _split_quantity(quantity: str) -> tuple[str, str]:
     return (match.group(1), match.group(2).strip())
 
 
+WEIGHT_UNITS = ("千克", "公斤", "KG", "kg", "KGS", "公斤/千克")
+
+
+def _is_weight_unit(unit: str) -> bool:
+    """这个单位是不是重量（报关单上「申报数量/申报单位」可能是套/件/个）。"""
+    text = (unit or "").strip()
+    if not text:
+        return False
+    return any(key in text for key in WEIGHT_UNITS)
+
+
 def build_rows(parsed: ParsedDeclaration) -> list[dict]:
     """把一份报关单展开成「一条商品一行」的字典列表。"""
     header = parsed.header
@@ -72,7 +83,13 @@ def build_rows(parsed: ParsedDeclaration) -> list[dict]:
         if header.contract_remark and header.contract_remark != contract_raw:
             base["解析警告"] = "；".join(filter(None, [warning, "合同号取自备注/续行"]))
         if item is not None:
-            weight, weight_unit = _split_quantity(item.quantity)
+            # 报关重量优先取「申报数量」；它是套装/件这类非重量单位时，
+            # 再退回「第二数量」（报关单常把重量放在这一栏），最后才用法定数量。
+            weight, weight_unit = _split_quantity(item.declare_quantity or item.quantity)
+            if not _is_weight_unit(weight_unit):
+                alt_weight, alt_unit = _split_quantity(item.second_quantity)
+                if alt_weight and _is_weight_unit(alt_unit):
+                    weight, weight_unit = alt_weight, alt_unit
             base.update(
                 {
                     "商品序号": item.serial,

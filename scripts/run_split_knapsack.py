@@ -63,6 +63,7 @@ from app.services.shipment_detail import (  # noqa: E402
     ensure_shipment_detail,
     shipment_invoices_for_contract,
 )
+from app.services.shipment_index import normalise_purchase_code  # noqa: E402
 from app.services.supplier_names import SupplierNames  # noqa: E402
 
 CACHE = PROJECT_ROOT / "data" / "cache"
@@ -506,6 +507,33 @@ def directed_split_rows(
     ]
     if not pool:
         return [], "按合同订单过滤后没有产品行"
+    # **同一张出运单下的其它订单产品行也要纳入**：一张出运单常常合并了多个外销单
+    # （如出运单 `PI-26MT-05G062&26MT-05X137`），而报关单的合同号只写了其中一个
+    # （`26MT-05G062`）。只按合同号过滤会把 `26MT-05X137` 的货整行丢掉，
+    # 那份采购单的成本就永远落不到任何一条记录上。
+    invoices = {
+        str(line.raw.get("invoice_code") or "").strip()
+        for line in pool
+        if str(line.raw.get("invoice_code") or "").strip()
+    }
+    if invoices:
+        def _marker(item) -> tuple:
+            raw = getattr(item, "raw", None) or {}
+            return (
+                str(getattr(item, "purchase_code", "") or "").strip().upper(),
+                re.sub(r"\s+", " ", str(raw.get("sku") or "").strip()).upper(),
+                str(raw.get("amount_usd") or "").strip(),
+                str(raw.get("quantity") or "").strip(),
+            )
+
+        seen_markers = {_marker(line) for line in pool}
+        for line in iter_lines(lines_raw):
+            marker = _marker(line)
+            if marker in seen_markers:
+                continue
+            if str(line.raw.get("invoice_code") or "").strip() in invoices:
+                pool.append(line)
+                seen_markers.add(marker)
     groups: dict[str, list] = {}
     for line in pool:
         key = names.short(line.supplier) or line.purchase_code or "(未知供应商)"
@@ -688,6 +716,24 @@ def _group_matches(members: list, row: dict) -> bool:
     return bool(want_name) and any(line.customs_name == want_name for line in members)
 
 
+def line_rmb_cents(line) -> int:
+    """出运产品行的人民币采购金额（分）。
+
+    组合行（按供应商/产品类型打包）取成员之和；被部分出运占用的行按数量折算。
+    这个数值是「采购金额分摊」的权重来源：同一采购单拆到多张报关单时，
+    按各行实际装了多少货（人民币口径）分摊，比按产品类型汇总更准。
+    """
+    members = getattr(line, "members", None)
+    if members:
+        return sum(line_rmb_cents(member) for member in members)
+    cents = to_cents((getattr(line, "raw", None) or {}).get("amount_rmb"))
+    total_qty = getattr(line, "total_qty", None) or Decimal(0)
+    qty = getattr(line, "quantity", None) or Decimal(0)
+    if cents and total_qty > 0 and 0 < qty < total_qty:
+        cents = int((Decimal(cents) * qty / total_qty).to_integral_value())
+    return cents
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--only", default="", help="只跑这些合同（逗号分隔）")
@@ -794,7 +840,9 @@ def main() -> None:
                     {
                         "invoice_code": invoice,
                         "order_codes": [row.get("销售订单号")],
-                        "purchase_code": row.get("采购订单号"),
+                        "purchase_code": normalise_purchase_code(
+                            str(row.get("采购订单号") or "")
+                        ),
                         "supplier": row.get("供应商名称")
                         or purchase_supplier_name(row)
                         or supplier_by_code().get(str(row.get("供应商编码") or "").strip(), ""),
@@ -1254,6 +1302,7 @@ def main() -> None:
                             "供应商": items[0].supplier,
                             "采购单号": purchase_code,
                             "出运金额合计": f"{share / 100:.2f}",
+                            "出运采购金额合计": f"{sum(line_rmb_cents(x) for x in items) / 100:.2f}",
                             "报关金额": f"{allocated_cents / 100:.2f}",
                             "客户费用分摊": f"{fee_cents / 100:.2f}",
                             "产品行数": len(items),
@@ -1304,6 +1353,40 @@ def main() -> None:
             }
         )
 
+    # 「混装报关」的品名口径（业务规则，纯结构性、对全量一视同仁）：
+    # 同一 `报关单号` + 同一 `采购单号` + 同一 `供应商` 下拆出了两种及以上的**实际**
+    # 产品类型时，谁是谁无法区分，此时以**实际品名**为准（飞书手工拆行时也是这么写的）；
+    # 其余情况一律保留报关单原件上的品名。
+    mixed_groups: dict[tuple[str, str, str], set[str]] = defaultdict(set)
+    for row in split_rows:
+        product = str(row.get("产品类型") or "").strip()
+        if product:
+            mixed_groups[
+                (
+                    str(row.get("报关单号") or ""),
+                    str(row.get("采购单号") or ""),
+                    str(row.get("供应商简称") or ""),
+                )
+            ].add(product)
+    ambiguous_groups = {key for key, kinds in mixed_groups.items() if len(kinds) >= 2}
+    mixed_named = 0
+    for row in split_rows:
+        key = (
+            str(row.get("报关单号") or ""),
+            str(row.get("采购单号") or ""),
+            str(row.get("供应商简称") or ""),
+        )
+        product = str(row.get("产品类型") or "").strip()
+        if key in ambiguous_groups and product and str(row.get("报关品名") or "") != product:
+            row["报关品名"] = product
+            mixed_named += 1
+    if mixed_named:
+        print(
+            f"[混装品名] {len(ambiguous_groups)} 组「同报关单+同采购单+同供应商」含多种实际品名，"
+            f"其中 {mixed_named} 行按实际品名修正报关品名",
+            flush=True,
+        )
+
     ref: dict[tuple[str, str], set[str]] = defaultdict(set)
     ref_contract: dict[tuple[str, str], str] = {}
     for record in json.loads(REF_PATH.read_text(encoding="utf-8")):
@@ -1332,6 +1415,15 @@ def main() -> None:
 
     same: list[dict] = []
     bad: list[dict] = []
+    missing: list[dict] = []
+    # 同一报关单内供应商的**整体**集合：用来识别「飞书漏拆」——
+    # 我方按实际品名多出一行、飞书没写这一行，但整张单的供应商其实都对得上。
+    decl_system: dict[str, set[str]] = defaultdict(set)
+    decl_ref: dict[str, set[str]] = defaultdict(set)
+    for (decl, _name), shorts in system.items():
+        decl_system[decl] |= shorts
+    for (decl, _name), shorts in ref.items():
+        decl_ref[decl] |= shorts
     for (decl, name), shorts in sorted(system.items()):
         expected = ref.get((decl, name), set())
         record = {
@@ -1344,6 +1436,12 @@ def main() -> None:
         if shorts == expected:
             record["比对结果"] = "一致"
             same.append(record)
+        elif not expected and decl_system.get(decl, set()) == decl_ref.get(decl, set()):
+            # 飞书这一行没写：整张单的供应商都对得上，只是飞书少拆了一行
+            record["比对结果"] = (
+                f"飞书漏拆（我方多一行「{name}」，飞书该单没有这一行）"
+            )
+            missing.append(record)
         else:
             record["比对结果"] = (
                 f"不一致 多={sorted(shorts - expected)} 缺={sorted(expected - shorts)}"
@@ -1402,34 +1500,46 @@ def main() -> None:
     # ERP 自身的矛盾数据（供应商与产品对不上）也要进异常表
     bad.extend(data_anomalies)
 
-    # 已人工核实的飞书/睿贝冲突：从「待解决异常」里摘出来单列，避免和真·未解决问题混在一起
+    # 已人工核实的飞书/睿贝冲突：从「正常/待解决异常」里摘出来单列，
+    # 避免和真·未解决问题混在一起。注意**正常行也要摘**——有些单子比对当时
+    # 只是供应商集合一致，事后核实整张单的数据都是错的（如 25MT-03R625Y）。
     verified_path = PROJECT_ROOT / "data" / "reference" / "verified_conflicts.json"
     verified: list[dict] = []
     if verified_path.exists():
         cases = json.loads(verified_path.read_text(encoding="utf-8")).get("cases") or []
-        index = {(case.get("报关单号"), case.get("报关品名")): case for case in cases}
-        remaining: list[dict] = []
-        for row in bad:
-            case = index.get((row.get("报关单号"), row.get("报关品名")))
-            if case is None:
-                remaining.append(row)
-                continue
-            verified.append(
-                {
-                    **row,
-                    "比对结果": (
-                        f"已核实（{case.get('类别') or '飞书错'}）：{case.get('结论')}"
-                        f"｜{case.get('证据')}"
-                    ),
-                }
-            )
-        bad = remaining
+        # 核实是按**整张报关单**核的（人工核实结论本来就是针对这张单的），
+        # 所以以报关单号为键：混装单的报关品名会按实际品名改写，用「报关单号+品名」
+        # 当键会在改写后失配。
+        index = {str(case.get("报关单号") or ""): case for case in cases}
+        for source in ("bad", "same", "missing"):
+            rows = {"bad": bad, "same": same, "missing": missing}[source]
+            remaining: list[dict] = []
+            for row in rows:
+                case = index.get(str(row.get("报关单号") or ""))
+                if case is None:
+                    remaining.append(row)
+                    continue
+                verified.append(
+                    {
+                        **row,
+                        "比对结果": (
+                            f"已核实（{case.get('类别') or '飞书错'}）：{case.get('结论')}"
+                            f"｜{case.get('证据')}"
+                        ),
+                    }
+                )
+            if source == "bad":
+                bad = remaining
+            elif source == "missing":
+                missing = remaining
+            else:
+                same = remaining
     else:
         print("（未找到 data/reference/verified_conflicts.json，跳过已核实冲突分列）")
 
     detail_columns = [
         "报关单号", "合同号_1", "报关品名", "海关编码", "产品类型",
-        "供应商简称", "供应商", "采购单号", "出运金额合计",
+        "供应商简称", "供应商", "采购单号", "出运金额合计", "出运采购金额合计",
         "报关金额", "客户费用分摊", "产品行数",
     ]
     group_columns = [
@@ -1440,6 +1550,7 @@ def main() -> None:
     write_rows(same, OUT_DIR / "拆单结果_正常.xlsx", group_columns)
     write_rows(bad, OUT_DIR / "拆单结果_异常.xlsx", group_columns)
     write_rows(verified, OUT_DIR / "拆单结果_已核实.xlsx", group_columns)
+    write_rows(missing, OUT_DIR / "拆单结果_飞书漏拆.xlsx", group_columns)
     # 费用分摊台账：逐种费用记录命中的分摊口径
     report_dir = PROJECT_ROOT / ".cache" / "erp" / "reports"
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -1497,6 +1608,7 @@ def main() -> None:
         "比对单元(报关单+品名)": len(system),
         "一致": len(same),
         "已核实": len(verified),
+        "飞书漏拆": len(missing),
         "异常": len(bad),
     }
     (OUT_DIR / "拆单统计.json").write_text(

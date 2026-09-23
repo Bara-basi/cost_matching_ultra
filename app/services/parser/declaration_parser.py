@@ -399,35 +399,76 @@ def _item_section(lines: list[str]) -> list[str]:
 
 
 def _parse_items(lines: list[str]) -> list[DeclarationItem]:
+    """商品明细（版式 1）。
+
+    一条商品可能有三组数量：`法定数量/法定单位`（跟在商品行后面）、`第二数量/第二单位`、
+    `申报数量/申报单位`。**报关重量要取"申报数量"**——例如 `223320260001346587`：
+    法定数量 26 套、申报数量 1076 千克，按法定数量取会得到 26（错 40 倍）。
+    没有申报数量时才退回法定数量；`报关重量` 若仍不是重量单位，再退回第二数量。
+    """
+    section = _item_section(lines)
     items: list[DeclarationItem] = []
-    pending: DeclarationItem | None = None
-    for line in _item_section(lines):
-        text = line.strip()
-        if not text:
-            continue
+    index = 0
+    while index < len(section):
+        text = section[index].strip()
         match = ITEM_RE.match(text)
-        if match:
-            serial, hs_code, name = match.groups()
-            pending = DeclarationItem(
-                serial=int(serial), hs_code=hs_code, product_name=name
-            )
-            items.append(pending)
+        if not match:
+            index += 1
             continue
-        if pending is None or pending.quantity:
-            continue
-        value = QTY_RE.match(text)
-        if not value:
-            continue
-        quantity, country, price, total, currency = value.groups()
-        pending.quantity = quantity
-        pending.unit = _unit_of(quantity)
-        pending.declare_quantity = quantity
-        pending.declare_unit = pending.unit
-        pending.destination_country = country
-        pending.unit_price = price
-        pending.total_price = total
-        pending.currency = currency
+        serial, hs_code, name = match.groups()
+        item = DeclarationItem(serial=int(serial), hs_code=hs_code, product_name=name)
+        items.append(item)
+        # 收集本商品的行（到下一个商品行为止）
+        block: list[str] = []
+        cursor = index + 1
+        while cursor < len(section) and not ITEM_RE.match(section[cursor].strip()):
+            value = section[cursor].strip()
+            if value:
+                block.append(value)
+            cursor += 1
+        index = cursor
+
+        for line in block:
+            value = QTY_RE.match(line)
+            if not value:
+                continue
+            quantity, country, price, total, currency = value.groups()
+            item.quantity = quantity
+            item.unit = _unit_of(quantity)
+            item.declare_quantity = quantity
+            item.declare_unit = item.unit
+            item.destination_country = country
+            item.unit_price = price
+            item.total_price = total
+            item.currency = currency
+            break
+
+        for label, slot in (("第二数量/第二单位", "second"), ("申报数量/申报单位", "declare")):
+            for position, line in enumerate(block):
+                if not line.startswith(label):
+                    continue
+                token = _next_quantity(block[position + 1 :])
+                if not token:
+                    break
+                if slot == "second":
+                    item.second_quantity = token
+                    item.second_unit = _unit_of(token)
+                else:
+                    item.declare_quantity = token
+                    item.declare_unit = _unit_of(token)
+                break
     return items
+
+
+def _next_quantity(lines: list[str]) -> str:
+    """从若干行里挑出第一个「数字 + 单位」的令牌（如 `1076千克 (410) 美元` → `1076千克`）。"""
+    for line in lines:
+        token = line.strip().split()[0] if line.strip() else ""
+        if token and re.match(r"^[\d,.]+\S*$", token):
+            return token
+        if line.startswith(("法定数量", "第二数量", "申报数量", "商品序号")):
+            break
+    return ""
 
 
 def _unit_of(quantity: str) -> str:

@@ -52,6 +52,9 @@ class DeclarationItem:
     currency: str = ""
     declare_quantity: str = ""
     declare_unit: str = ""
+    # `第二数量/第二单位`（报关单上常用来放重量）
+    second_quantity: str = ""
+    second_unit: str = ""
 
 
 @dataclass

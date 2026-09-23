@@ -63,6 +63,21 @@ def row_orders(row: dict[str, Any]) -> list[str]:
     return out
 
 
+DOUBLE_PREFIX = re.compile(r"^(\d{2}MT-)\1", re.IGNORECASE)
+
+
+def normalise_purchase_code(code: str) -> str:
+    """采购单号归一：ERP 出运行里偶尔把年份前缀写两遍
+    （`26MT-26MT-03T094Y-YH`，真实采购单是 `26MT-03T094Y-YH`），不归一就找不到入库单。
+    """
+    text = str(code or "").strip()
+    while True:
+        fixed = DOUBLE_PREFIX.sub(r"\1", text)
+        if fixed == text:
+            return text
+        text = fixed
+
+
 def _normalise(row: dict[str, Any], invoice: str, shipment_id: str) -> dict[str, Any]:
     def text_field(name: str) -> str:
         """字段值归一：把内部空白（含换行）压成单空格。
@@ -73,7 +88,7 @@ def _normalise(row: dict[str, Any], invoice: str, shipment_id: str) -> dict[str,
         raw = str(row.get(name) or "")
         return re.sub(r"\s+", " ", raw).strip()
 
-    purchase = str(row.get("采购订单号") or "").strip()
+    purchase = normalise_purchase_code(str(row.get("采购订单号") or ""))
     return {
         "invoice_code": invoice,
         "shipment_id": shipment_id,
