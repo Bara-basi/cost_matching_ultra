@@ -5,3 +5,9 @@ __pycache__/
 *.pyc
 .env
 data/
+outputs/
+.cache/
+outputs/
+!outputs/customs_parse/
+outputs/
+.cache

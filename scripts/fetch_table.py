@@ -31,10 +31,17 @@ def main() -> None:
     parser.add_argument("--tag", default="copy_full")
     parser.add_argument("--app-token", default=None)
     parser.add_argument("--table-id", default=None)
+    parser.add_argument("--fields", action="store_true", help="同时导出字段定义")
     args = parser.parse_args()
     app_token = args.app_token or get_config("MT_FINANCE_AI_TBALE_APP_TOKEN")
     table_id = args.table_id or get_config("MT_FINANCE_AI_TABLE_ID")
     target = do_fetch(app_token, table_id, args.tag)
+    if args.fields:
+        client = FeishuClient()
+        fields = client.list_fields(app_token, table_id)
+        out = CACHE_DIR / f"fields_{args.tag}.json"
+        out.write_text(json.dumps(fields, ensure_ascii=False, indent=1), encoding="utf-8")
+        print(f"written {out}")
     print(f"written {target}")
 
 
