@@ -89,6 +89,12 @@ def _normalise(row: dict[str, Any], invoice: str, shipment_id: str) -> dict[str,
         return re.sub(r"\s+", " ", raw).strip()
 
     purchase = normalise_purchase_code(str(row.get("采购订单号") or ""))
+    product_code = text_field("产品编码")
+    from app.services.product_master import category_of
+
+    # 产品类型 = 商品资料「类别名称」去掉部门括号后的粗分类（2026-09-28 用户口径）；
+    # 商品资料没抓到/没有类别时留空，交给拆单阶段用报关品名兜底。
+    product_type = category_of(product_code) if product_code else ""
     return {
         "invoice_code": invoice,
         "shipment_id": shipment_id,
@@ -101,6 +107,8 @@ def _normalise(row: dict[str, Any], invoice: str, shipment_id: str) -> dict[str,
         "hs_code": str(row.get("海关编码") or "").strip(),
         "unit_price_usd": str(row.get("外销单价") or "").strip(),
         "customs_name": text_field("海关商品（中文）"),
+        "product_code": product_code,
+        "product_type": product_type,
         "quantity": str(row.get("出运数量") or "").strip(),
         "order_quantity": str(row.get("订单数量") or "").strip(),
         "unit": str(row.get("计量单位") or "").strip(),

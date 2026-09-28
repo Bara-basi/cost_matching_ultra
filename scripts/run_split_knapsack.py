@@ -41,7 +41,10 @@ from app.services.knapsack_split import (  # noqa: E402
     allocate_fee,
     assign_to_rows,
     bundle_lines,
+    decl_category,
     iter_lines,
+    line_product_type,
+    name_matches,
     solve,
     solve_residual,
     to_cents,
@@ -180,7 +183,8 @@ LEVELS: list[tuple[str, object]] = [
     ("按供应商打包", lambda line, n: n.short(line.supplier) or "(未知供应商)"),
     ("按供应商+产品类型打包", lambda line, n: (
         n.short(line.supplier) or "(未知供应商)",
-        line.customs_name or line.hs_code,
+        # 打包仍以 ERP 出运品名为主（求解器一直在用的口径），缺名时才用商品资料粗分类兜底
+        line.customs_name or line_product_type(line) or line.hs_code,
     )),
     ("逐条产品行", None),
 ]
@@ -249,6 +253,156 @@ def purchase_supplier_name(row: dict) -> str:
 
 
 _SHIPMENT_TOTALS: dict[str, int] | None = None
+
+_PRODUCT_CATEGORY: dict[str, str] | None = None
+
+
+def product_category(code: Any) -> str:
+    """产品编码 → 商品资料里的粗分类（类别名称去部门括号）；没有缓存返回空串。
+
+    数据由 `scripts/fetch_product_categories.py` 抓取到
+    `.cache/erp/details/products/`，这里是进程内一次性的内存索引。
+    """
+    global _PRODUCT_CATEGORY
+    if _PRODUCT_CATEGORY is None:
+        from app.services.product_master import load_index
+
+        _PRODUCT_CATEGORY = {
+            key: str(value.get("类别") or "") for key, value in load_index().items()
+        }
+    return _PRODUCT_CATEGORY.get(str(code or "").strip(), "")
+
+
+def row_product_type(row: dict) -> str:
+    """出运产品行的品类：索引里已算好的 product_type 优先，否则按产品编码现算。"""
+    return str(row.get("product_type") or "").strip() or product_category(
+        row.get("产品编码") or row.get("product_code")
+    )
+
+
+def _dec(value: Any) -> Decimal:
+    """宽松转 Decimal（空/千分位/脏文本都吞掉，取不到算 0）。"""
+    text = str(value or "").replace(",", "").strip()
+    if not text:
+        return Decimal(0)
+    try:
+        return Decimal(text)
+    except Exception:  # noqa: BLE001
+        return Decimal(0)
+
+
+def fmt_weight(value: Decimal) -> str:
+    """重量输出：保留 2 位小数，去掉无意义的尾零。"""
+    text = f"{value:.2f}"
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+_GRN_WEIGHT: dict[str, Decimal] = {}
+
+
+def grn_weight_for(purchase_code: str) -> Decimal:
+    """采购单 → 入库单附件里能核到的重量（kg）；核不到返回 0。
+
+    取 `grn_select.select()` 保留下来的入库单，优先加明细行 `weight`，
+    没有行级重量时退回 `settled_totals.weight`。
+    """
+    code = str(purchase_code or "").strip()
+    if not code:
+        return Decimal(0)
+    if code in _GRN_WEIGHT:
+        return _GRN_WEIGHT[code]
+    total = Decimal(0)
+    try:
+        from app.services.grn_extract import cache_path, to_decimal
+        from app.services.grn_select import select
+
+        for entry in select(code).get("kept") or []:
+            path = cache_path(code, entry.get("file") or "")
+            if not path.exists():
+                continue
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            found = Decimal(0)
+            for line in payload.get("lines") or []:
+                value = to_decimal(line.get("weight"))
+                if value:
+                    found += value
+            if not found:
+                value = to_decimal((payload.get("settled_totals") or {}).get("weight"))
+                if value:
+                    found = value
+            total += found
+    except Exception:  # noqa: BLE001
+        total = Decimal(0)
+    _GRN_WEIGHT[code] = total
+    return total
+
+
+# 飞书那套粗分类（data/reference/feishu_product_map.json 的取值集合）
+KNOWN_CATEGORIES = {
+    "法兰", "管件", "无缝管", "镍基无缝管", "焊管", "焊材", "板棒", "盘管", "三角丝", "其他",
+}
+
+
+def coarse_label(*candidates: Any) -> str:
+    """把若干候选名归到同一套粗分类：已是粗分类 → 直接用；否则按映射表折算；
+    都折算不出（如「不锈钢线」）时再用报关品名折算；最后才保留原值。
+    """
+    for value in candidates:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        if text in KNOWN_CATEGORIES:
+            return text
+        mapped = decl_category(text)
+        if mapped:
+            return mapped
+    for value in candidates:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def allocate_weight(
+    total: Decimal,
+    purchase_codes: list[str],
+    amount_cents: list[int],
+) -> tuple[list[Decimal], str]:
+    """把一行报关行重量摊到它拆出的各条记录上（2026-09-28 用户口径）。
+
+    1. 单条记录 → 整笔给它（重量没被拆）；
+    2. 多条记录、且各采购单的入库单附件都能核到重量 → 按附件重量占比摊；
+    3. 否则 → 按已算好的报关金额占比摊。
+    最后一组吸收分位尾差，保证合计等于该报关行的报关重量（不漏）。
+    """
+    count = len(purchase_codes)
+    if count == 0 or total <= 0:
+        return [Decimal(0)] * count, ""
+    if count == 1:
+        return [total], "单条记录，报关重量直接回填"
+
+    grn = [grn_weight_for(code) for code in purchase_codes]
+    if all(value > 0 for value in grn):
+        basis = grn
+        source = f"按入库单附件重量占比分摊（附件重量合计 {fmt_weight(sum(grn, Decimal(0)))}kg）"
+    else:
+        basis = [Decimal(cents) for cents in amount_cents]
+        source = "按报关金额占比分摊（未取得入库单附件重量）"
+    base = sum(basis, Decimal(0))
+    if base <= 0:
+        basis = [Decimal(1)] * count
+        base = Decimal(count)
+
+    parts: list[Decimal] = []
+    used = Decimal(0)
+    for position, value in enumerate(basis):
+        if position == count - 1:
+            part = total - used
+        else:
+            part = (total * value / base).quantize(Decimal("0.01"))
+            used += part
+        parts.append(part)
+    return parts, source
 # 报关金额 ≈ 出运单出运总金额 的容差（分）：实测只差 1 分（26MT-03P074Y-B
 # 报关 48840.75 vs 出运单 48840.74），留一点点余量但不至于认错单
 AMOUNT_MATCH_CENTS = 5
@@ -306,6 +460,10 @@ def shipment_lines_by_contract() -> dict[str, list[dict]]:
             ) or supplier_by_code().get(str(line.get("supplier_code") or "").strip(), "")
             if filled:
                 line = {**line, "supplier": filled}
+        if not str(line.get("product_type") or "").strip():
+            kind = row_product_type(line)
+            if kind:
+                line = {**line, "product_type": kind}
         keys = {strip_pi(c) for c in (line.get("order_codes") or [])}
         keys.add(strip_pi(line.get("invoice_code")))
         keys.add(strip_pi(line.get("purchase_code")))
@@ -687,12 +845,14 @@ def directed_split_rows(
 
     def emit(decl: str, row: dict, key: str, members: list, total: int) -> dict:
         declared_cents = to_cents(row.get("amount"))
+        declared_weight = _dec(row.get("weight"))
+        parts, basis = allocate_weight(declared_weight, [members[0].purchase_code], [declared_cents])
         return {
             "报关单号": decl,
             "合同号_1": contract,
             "报关品名": str(row.get("name") or ""),
             "海关编码": str(row.get("hs") or ""),
-            "产品类型": members[0].customs_name,
+            "产品类型": coarse_label(line_product_type(members[0]), row.get("name")),
             "供应商简称": key,
             "供应商": members[0].supplier,
             "采购单号": "、".join(
@@ -705,6 +865,8 @@ def directed_split_rows(
             "出运采购金额合计": f"{sum(line_rmb_cents(line) for line in members) / 100:.2f}",
             "报关金额": f"{declared_cents / 100:.2f}",
             "客户费用分摊": f"{(declared_cents - total) / 100:.2f}",
+            "报关重量": fmt_weight(parts[0]),
+            "重量分摊依据": basis,
             "产品行数": len(members),
         }
 
@@ -719,8 +881,10 @@ def directed_split_rows(
         if len(parts) <= 1:
             return [emit(decl, row, key, members, total)]
         declared_cents = to_cents(row.get("amount"))
+        declared_weight = _dec(row.get("weight"))
         out: list[dict] = []
         allocated_all = 0
+        allocated_list: list[int] = []
         for position, (_item_key, items) in enumerate(parts):
             share = sum(line.amount for line in items)
             if position == len(parts) - 1:
@@ -730,13 +894,20 @@ def directed_split_rows(
                     round(declared_cents * share / total) if total else share
                 )
                 allocated_all += allocated_cents
+            allocated_list.append(allocated_cents)
+        weight_parts, weight_basis = allocate_weight(
+            declared_weight, [items[0].purchase_code for _k, items in parts], allocated_list
+        )
+        for position, (_item_key, items) in enumerate(parts):
+            share = sum(line.amount for line in items)
+            allocated_cents = allocated_list[position]
             out.append(
                 {
                     "报关单号": decl,
                     "合同号_1": contract,
                     "报关品名": str(row.get("name") or ""),
                     "海关编码": str(row.get("hs") or ""),
-                    "产品类型": items[0].customs_name,
+                    "产品类型": coarse_label(line_product_type(items[0]), row.get("name")),
                     "供应商简称": key,
                     "供应商": items[0].supplier,
                     "采购单号": items[0].purchase_code,
@@ -746,6 +917,8 @@ def directed_split_rows(
                     ),
                     "报关金额": f"{allocated_cents / 100:.2f}",
                     "客户费用分摊": f"{(allocated_cents - share) / 100:.2f}",
+                    "报关重量": fmt_weight(weight_parts[position]),
+                    "重量分摊依据": weight_basis,
                     "产品行数": len(items),
                 }
             )
@@ -862,7 +1035,13 @@ def split_by_item(members: list) -> list[tuple[tuple[str, str], list]]:
     for line in members:
         key = (
             str(getattr(line, "purchase_code", "") or ""),
-            str(getattr(line, "customs_name", "") or "").strip(),
+            # 品类键：先用 ERP 出运品名（求解器一直在用的细分口径，保住已拆对的结果）；
+            # 出运品名缺失时用商品资料粗分类补位（本任务要修的缺口）
+            str(
+                getattr(line, "customs_name", "")
+                or line_product_type(line)
+                or ""
+            ).strip(),
         )
         buckets.setdefault(key, []).append(line)
     return list(buckets.items())
@@ -874,7 +1053,7 @@ def _group_matches(members: list, row: dict) -> bool:
     want_name = str(row.get("name") or "").strip()
     if want_hs and any(hs_compatible(line.hs_code, want_hs) for line in members):
         return True
-    return bool(want_name) and any(line.customs_name == want_name for line in members)
+    return bool(want_name) and any(name_matches(line, want_name) for line in members)
 
 
 def line_rmb_cents(line) -> int:
@@ -1011,6 +1190,8 @@ def main() -> None:
                         "hs_code": row.get("海关编码"),
                         "unit_price_usd": row.get("外销单价"),
                         "customs_name": row.get("海关商品（中文）"),
+                        "product_code": row.get("产品编码"),
+                        "product_type": row_product_type(row),
                         "quantity": row.get("出运数量"),
                         "sku": row.get("SKU"),
                         "unit": str(row.get("计量单位") or "").strip()
@@ -1432,8 +1613,10 @@ def main() -> None:
             for index, row in enumerate(rows):
                 picked = row_map.get(index, [])
                 for line in picked:
-                    if str(line.customs_name or "").strip():
-                        decl_products[decl].add(str(line.customs_name).strip())
+                    # 混装放行要比对报关单上的品名，出运品名（细分）与粗分类都登记一份
+                    for kind in (line_product_type(line), str(line.customs_name or "").strip()):
+                        if kind:
+                            decl_products[decl].add(kind)
                 by_supplier: dict[str, list] = defaultdict(list)
                 for item in picked:
                     by_supplier[names.short(item.supplier)].append(item)
@@ -1459,16 +1642,40 @@ def main() -> None:
                     for short, supplier_items in by_supplier.items()
                     for (purchase_code, product_type), items in split_by_item(supplier_items)
                 ]
-                # 报关金额按各组货值比例分摊到行，差额即「客户费用分摊」：
-                # 出运金额合计 + 客户费用分摊 = 报关金额（每行都能对上，不会被误读成漏拆）
-                # 最后一组吸收分位尾差，保证各组合计正好等于报关金额
                 declared_cents = to_cents(row.get("amount"))
                 assigned_total = sum(x.amount for x in picked)
+                # —— 报关金额按各组货值比例分摊，最后一组吸收分位尾差 ——
+                # 出运金额合计 + 客户费用分摊 = 报关金额（每行都能对上，不会被误读成漏拆）
+                allocated_cents_list: list[int] = []
                 allocated_all = 0
+                for position, (_s, _p, _t, items) in enumerate(item_groups):
+                    share = sum(x.amount for x in items)
+                    if position == len(item_groups) - 1:
+                        allocated_cents = declared_cents - allocated_all
+                    else:
+                        allocated = (
+                            declared_cents * share / assigned_total
+                            if assigned_total
+                            else share
+                        )
+                        allocated_cents = int(round(allocated))
+                        allocated_all += allocated_cents
+                    allocated_cents_list.append(allocated_cents)
+
+                # —— 报关重量分摊（2026-09-28 用户口径）——
+                # 单条记录直接回填；多条记录优先按入库单附件重量，其次按报关金额占比，最后一组吸收尾差。
+                declared_weight = _dec(row.get("weight"))
+                weight_parts, weight_basis = allocate_weight(
+                    declared_weight,
+                    [group[1] for group in item_groups],
+                    allocated_cents_list,
+                )
+
                 for position, (short, purchase_code, product_type, items) in enumerate(
                     item_groups
                 ):
                     share = sum(x.amount for x in items)
+                    allocated_cents = allocated_cents_list[position]
                     # 成本补记行：同出运单里「只差 SKU」、报关单闭合不了也没人认领的那条，
                     # 只进成本（出运采购金额(RMB)），不进出运金额/报关金额
                     extra_lines: list = []
@@ -1480,16 +1687,9 @@ def main() -> None:
                                 continue
                             extra_seen.add(key)
                             extra_lines.append(extra)
-                    if position == len(item_groups) - 1:
-                        allocated_cents = declared_cents - allocated_all
-                    else:
-                        allocated = (
-                            declared_cents * share / assigned_total
-                            if assigned_total
-                            else share
-                        )
-                        allocated_cents = int(round(allocated))
-                        allocated_all += allocated_cents
+                    # 产品类型：商品资料粗分类优先；没有类别时按出运品名折算，
+                    # 仍取不到才用报关品名兜底（都归到同一套粗分类，避免粒度混用）
+                    final_product_type = coarse_label(product_type, row.get("name"))
                     fee_cents = allocated_cents - share
                     split_rows.append(
                         {
@@ -1499,7 +1699,7 @@ def main() -> None:
                             # 实际产品类型另立一列，拆单记录才既对得上主表、又能按产品类型对成本
                             "报关品名": str(row.get("name") or ""),
                             "海关编码": str(row.get("hs") or ""),
-                            "产品类型": product_type,
+                            "产品类型": final_product_type,
                             "供应商简称": short,
                             "供应商": items[0].supplier,
                             "采购单号": purchase_code,
@@ -1507,6 +1707,8 @@ def main() -> None:
                             "出运采购金额合计": f"{sum(line_rmb_cents(x) for x in items + extra_lines) / 100:.2f}",
                             "报关金额": f"{allocated_cents / 100:.2f}",
                             "客户费用分摊": f"{fee_cents / 100:.2f}",
+                            "报关重量": fmt_weight(weight_parts[position]),
+                            "重量分摊依据": weight_basis,
                             "产品行数": len(items),
                             "补记成本": "、".join(
                                 f"{extra.purchase_code} {str((extra.raw or {}).get('sku') or '')}"
@@ -1608,7 +1810,14 @@ def main() -> None:
             str(row.get("供应商简称") or ""),
         )
         product = str(row.get("产品类型") or "").strip()
-        if key in ambiguous_groups and product and str(row.get("报关品名") or "") != product:
+        # 只有「实际品名是细分名」时才改写报关品名；产品类型已经统一成粗分类后，
+        # 再拿它去覆盖报关品名会把「报关单品名」这一列写坏（文档口径：该列必须跟报关单一致）
+        if (
+            key in ambiguous_groups
+            and product
+            and product not in KNOWN_CATEGORIES
+            and str(row.get("报关品名") or "") != product
+        ):
             row["报关品名"] = product
             mixed_named += 1
     if mixed_named:
@@ -1766,12 +1975,13 @@ def main() -> None:
             else:
                 same = remaining
     else:
+        index = {}
         print("（未找到 data/reference/verified_conflicts.json，跳过已核实冲突分列）")
 
     detail_columns = [
         "报关单号", "合同号_1", "报关品名", "海关编码", "产品类型",
         "供应商简称", "供应商", "采购单号", "出运金额合计", "出运采购金额合计",
-        "报关金额", "客户费用分摊", "产品行数", "补记成本",
+        "报关金额", "客户费用分摊", "报关重量", "重量分摊依据", "产品行数", "补记成本",
     ]
     group_columns = [
         "报关单号", "合同号_1", "报关品名",
@@ -1821,6 +2031,38 @@ def main() -> None:
         OUT_DIR / "拆单_未认领产品行.xlsx",
         ["合同号_1", "出运单", "采购单号", "SKU", "供应商", "出运金额",
          "出运采购金额(RMB)", "报关品名", "同单已有孪生行", "处理"],
+    )
+    # 本地异常（不依赖飞书比对）：拆不出/多解/未落到报关行 + ERP 自身矛盾。
+    # 已人工核实的报关单不再算「未解决异常」（它们在拆单结果_已核实.xlsx 里）。
+    local_bad: list[dict] = []
+    for row in failures:
+        if index.get(str(row.get("报关单号") or "")):
+            continue
+        local_bad.append(
+            {
+                "类型": "拆单失败",
+                "报关单号": row.get("报关单号"),
+                "合同号_1": row.get("合同号_1"),
+                "报关品名": row.get("报关品名"),
+                "说明": row.get("比对结果"),
+            }
+        )
+    for row in data_anomalies:
+        if index.get(str(row.get("报关单号") or "")):
+            continue
+        local_bad.append(
+            {
+                "类型": "ERP数据矛盾",
+                "报关单号": row.get("报关单号"),
+                "合同号_1": row.get("合同号_1"),
+                "报关品名": row.get("报关品名"),
+                "说明": row.get("比对结果"),
+            }
+        )
+    write_rows(
+        local_bad,
+        OUT_DIR / "拆单_本地异常.xlsx",
+        ["类型", "报关单号", "合同号_1", "报关品名", "说明"],
     )
     # 费用分摊台账：逐种费用记录命中的分摊口径
     report_dir = PROJECT_ROOT / ".cache" / "erp" / "reports"

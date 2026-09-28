@@ -20,11 +20,64 @@ from dataclasses import dataclass, field
 from dataclasses import replace
 from decimal import Decimal
 import bisect
+import json
 import os
+from pathlib import Path
 
 from itertools import combinations
 from functools import lru_cache
 from typing import Any, Iterable
+
+
+# 报关品名 → 粗分类（飞书「产品类型」表，data/reference/feishu_product_map.json）。
+# 用于「出运行的粗分类」与「报关行的品名」互相印证。
+_DECL_CATEGORY: dict[str, str] | None = None
+
+
+def decl_category(name: str) -> str:
+    global _DECL_CATEGORY
+    if _DECL_CATEGORY is None:
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "data"
+            / "reference"
+            / "feishu_product_map.json"
+        )
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            _DECL_CATEGORY = {
+                str(key).strip(): str(value).strip()
+                for key, value in payload.items()
+                if str(key).strip()
+            }
+        except Exception:  # noqa: BLE001
+            _DECL_CATEGORY = {}
+    return _DECL_CATEGORY.get(str(name or "").strip(), "")
+
+
+def name_matches(line: "Line", want_name: str) -> bool:
+    """报关品名与产品行是否相符。
+
+    优先比 ERP 出运品名（原口径）；出运品名缺失时的兜底：把报关品名折算成粗分类，
+    与产品行的粗分类比较（产品类型现在是商品资料的粗分类）。
+    """
+    if not want_name:
+        return False
+    if line.customs_name and line.customs_name == want_name:
+        return True
+    want = decl_category(want_name)
+    return bool(want) and line_product_type(line) == want
+
+
+def line_product_type(line: "Line") -> str:
+    """产品行的品类（粗分类）。
+
+    **出运品名折算优先**：`海关商品（中文）` 是报关/对账一直在用的口径，折算成粗分类
+    后仍能区分「法兰 / 管件」这类实际差异；商品资料里同一个产品编码偶尔写错类别
+    （实测 三通的编码被标成法兰/管件混用），用它当主口径反而会把两种货并成一条。
+    出运品名缺失时才退回商品资料「类别名称」（这正是本任务要补的缺口）。
+    """
+    return decl_category(line.customs_name) or line.product_type
 
 
 def to_cents(value: Any) -> int:
@@ -59,51 +112,6 @@ def _half_sums_cached(items: tuple) -> dict[int, tuple[int, ...]]:
             # 同一个和只保留一种组合（价格相同的行在逻辑上等效）
             out.setdefault(total, tuple(items[i][0] for i in combo))
     return out
-
-
-def subset_sum(
-    items: list[tuple[int, int]],
-    target: int,
-    tolerance: int = 0,
-) -> list[int] | None:
-    """meet-in-the-middle 子集和：返回元素下标列表，找不到返回 None。
-
-    `tolerance`（单位：分）用于吸收报关金额与 ERP 出运金额之间的小额舍入差。
-    容差内取**最接近**目标的那组，保证确定性。
-    """
-    if target <= 0:
-        return []
-    if not items:
-        return None
-    total = sum(a for _, a in items)
-    if total < target - tolerance:
-        return None
-    if abs(total - target) <= tolerance:
-        return [i for i, _ in items]
-    mid = len(items) // 2
-    left, right = items[:mid], items[mid:]
-    left_sums = _half_sums(left)
-    right_sums = _half_sums(right)
-    if tolerance <= 0:
-        for left_sum, left_pick in left_sums.items():
-            need = target - left_sum
-            if need in right_sums:
-                return list(left_pick) + list(right_sums[need])
-        return None
-
-    ordered = sorted(right_sums.items())
-    keys = [key for key, _ in ordered]
-    best: tuple[int, list[int]] | None = None
-    for left_sum, left_pick in left_sums.items():
-        need = target - left_sum
-        position = bisect.bisect_left(keys, need)
-        for candidate_index in (position - 1, position, position + 1):
-            if 0 <= candidate_index < len(ordered):
-                right_sum, right_pick = ordered[candidate_index]
-                diff = abs(left_sum + right_sum - target)
-                if diff <= tolerance and (best is None or diff < best[0]):
-                    best = (diff, list(left_pick) + list(right_pick))
-    return best[1] if best else None
 
 
 def subset_sum_solutions(
@@ -199,6 +207,7 @@ class Line:
     supplier: str = ""
     hs_code: str = ""
     customs_name: str = ""
+    product_type: str = ""  # 粗分类（商品资料「类别名称」去部门括号），拆分/落单的品类键
     unit_price: int = 0    # 外销单价（分）
     quantity: Decimal = Decimal(0)
     purchase_code: str = ""
@@ -865,33 +874,6 @@ def solutions_equivalent(
     return len(signatures) == 1
 
 
-def subset_sum_alternative_exists(
-    items: list[tuple[int, int]],
-    target: int,
-    tolerance: int,
-    chosen: list[int],
-    *,
-    max_checks: int = 14,
-) -> bool:
-    """子集和是否**多解**：去掉已选中的某一条后，仍能凑出同样的金额。
-
-    只要存在另一组不同的记录也能凑到目标金额，就说明"猜"出来的这批记录不唯一，
-    业务上无法确定是哪一批，应当报错而不是判成功。
-    """
-    if not chosen:
-        return False
-    chosen_set = set(chosen)
-    for index in chosen[:max_checks]:
-        reduced = [item for item in items if item[0] != index]
-        if subset_sum(reduced, target, tolerance) is not None:
-            return True
-    # 反向：池子里没被选中的记录里，若有与已选集合等价的替换组，也视为多解
-    outside = [item for item in items if item[0] not in chosen_set]
-    if len(outside) <= MAX_ITEMS:
-        return subset_sum(outside, target, tolerance) is not None
-    return False
-
-
 # 单次精确求解的最大候选数（2^18 规模，实测很快；再大先用海关编码收窄）
 MAX_ITEMS = 36
 
@@ -927,7 +909,11 @@ def _narrow(target: Target, pool: list[Line]) -> list[Line]:
         return narrowed
     names = {str(r.get("name") or "").strip() for r in target.rows}
     names.discard("")
-    narrowed = [line for line in pool if line.customs_name in names] if names else []
+    narrowed = (
+        [line for line in pool if any(name_matches(line, name) for name in names)]
+        if names
+        else []
+    )
     return narrowed or pool
 
 
@@ -1077,6 +1063,7 @@ def iter_lines(rows: Iterable[dict[str, Any]]) -> list[Line]:
                 supplier=str(row.get("supplier") or ""),
                 hs_code=str(row.get("hs_code") or ""),
                 customs_name=str(row.get("customs_name") or ""),
+                product_type=str(row.get("product_type") or ""),
                 unit_price=unit,
                 quantity=quantity,
                 purchase_code=str(row.get("purchase_code") or ""),
@@ -1113,6 +1100,7 @@ def bundle_lines(
                 supplier=members[0].supplier,
                 hs_code=members[0].hs_code,
                 customs_name=members[0].customs_name,
+                product_type=line_product_type(members[0]),
                 purchase_code="、".join(sorted({m.purchase_code for m in members if m.purchase_code})),
                 unit_price=0,
                 quantity=Decimal(0),
@@ -1122,11 +1110,6 @@ def bundle_lines(
             )
         )
     return out
-
-
-def bundle_amounts(lines: list[Line]) -> dict[str, int]:
-    """调试用：返回「组合名 -> 金额（分）」。"""
-    return {str(line.raw.get("_bundle")): line.amount for line in lines}
 
 
 # 费用分摊口径。`none` = 这笔费用**不分配给任何报关单**（即不参与报关金额闭合）。
@@ -1185,90 +1168,6 @@ def allocate_fee(
             shares[decl] = left
         else:
             part = int(amount * keys[decl] / total)
-            shares[decl] = part
-            left -= part
-    return shares
-
-
-def plan_fee_shares(
-    declarations: dict[str, list[dict[str, Any]]],
-    fees: "dict[str, int] | int",
-    modes: "dict[str, str] | str",
-) -> dict[str, int]:
-    """把多笔费用按各自口径分摊后汇总到每张报关单。
-
-    `fees` 支持「单笔金额 + 单一 mode」的旧用法，也支持「{费用名: 金额} + {费用名: 口径}」。
-    """
-    decls = list(declarations)
-    if isinstance(fees, int):
-        return allocate_fee(declarations, fees, modes if isinstance(modes, str) else "equal")
-    if isinstance(modes, str):
-        modes = {name: modes for name in fees}
-    shares = {decl: 0 for decl in decls}
-    for name, amount in fees.items():
-        part = allocate_fee(declarations, amount, modes.get(name, "equal"))
-        for decl, value in part.items():
-            shares[decl] += value
-    return shares
-
-
-def plan_freight_shares(
-    declarations: dict[str, list[dict[str, Any]]],
-    freight_cents: int,
-    mode: str,
-) -> dict[str, int]:
-    """把一次出运的运费分摊到各张报关单。
-
-    实测口径不稳定，因此提供多种分摊方式供自动择优：
-    - `equal`     按报关单张数平分（26MT-07T042 实测吻合）
-    - `by_weight` 按报关重量分摊
-    - `by_amount` 按报关金额分摊
-    - `none`      不扣减（成交方式非 CIF/无运费时）
-    """
-    decls = list(declarations)
-    if not decls or freight_cents <= 0 or mode == "none":
-        return {decl: 0 for decl in decls}
-
-    if mode == "equal":
-        share = freight_cents // len(decls)
-        shares = {decl: share for decl in decls}
-        # 余数给最大的报关单
-        rest = freight_cents - share * len(decls)
-        if rest:
-            biggest = max(
-                decls,
-                key=lambda d: sum(to_cents(r.get("amount")) for r in declarations[d]),
-            )
-            shares[biggest] += rest
-        return shares
-
-    def weight_sum(rows: list[dict[str, Any]]) -> int:
-        total = 0
-        for row in rows:
-            text = str(row.get("weight") or "0").replace(",", "").strip()
-            try:
-                total += int(round(float(text) * 100))
-            except ValueError:
-                continue
-        return total
-
-    if mode == "by_weight":
-        keys = {decl: max(weight_sum(rows), 0) for decl, rows in declarations.items()}
-    else:
-        keys = {
-            decl: sum(to_cents(r.get("amount")) for r in rows)
-            for decl, rows in declarations.items()
-        }
-    total = sum(keys.values())
-    if total <= 0:
-        return {decl: 0 for decl in decls}
-    shares: dict[str, int] = {}
-    left = freight_cents
-    for index, decl in enumerate(decls):
-        if index == len(decls) - 1:
-            shares[decl] = left
-        else:
-            part = int(freight_cents * keys[decl] / total)
             shares[decl] = part
             left -= part
     return shares
@@ -1446,7 +1345,7 @@ def _assign_to_rows_by_bundle(
         """整组货是否与这一报关行的海关编码/品名相符。"""
         if row_hs[index] and all(line.hs_code == row_hs[index] for line in members):
             return True
-        if row_name[index] and any(line.customs_name == row_name[index] for line in members):
+        if row_name[index] and any(name_matches(line, row_name[index]) for line in members):
             return True
         return False
 
@@ -1572,7 +1471,7 @@ def _assign_to_rows_by_attribute(
         want_name = str(row.get("name") or "").strip()
         if not want_name:
             continue
-        picked = [line for line in remaining if line.customs_name == want_name]
+        picked = [line for line in remaining if name_matches(line, want_name)]
         if picked:
             result[index].extend(picked)
             remaining = [line for line in remaining if line not in picked]
@@ -1621,7 +1520,7 @@ def _assign_to_rows_by_amount(
                     score += 10_000
             if row_hs[index] and line.hs_code and row_hs[index] == line.hs_code:
                 score += 1_000
-            if row_name[index] and line.customs_name and row_name[index] == line.customs_name:
+            if row_name[index] and name_matches(line, row_name[index]):
                 score += 500
             target = targets[index]
             deficit = abs(target - (filled[index] + line.amount))

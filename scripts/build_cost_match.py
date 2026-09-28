@@ -767,15 +767,6 @@ def verification_key(row: dict) -> tuple:
     )
 
 
-def verification_unit_key(row: dict) -> tuple:
-    """「同一条记录」的粗判据（不含金额）：用来判断这条还在不在异常里。"""
-    return (
-        str(row.get("报关单号") or ""),
-        str(row.get("采购单号") or ""),
-        str(row.get("供应商简称") or ""),
-    )
-
-
 def load_verification(path: Path) -> tuple[list[str], list[dict]]:
     """读回上一轮的待核实清单（累计用）。
 

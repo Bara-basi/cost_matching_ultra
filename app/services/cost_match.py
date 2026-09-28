@@ -54,6 +54,7 @@ from app.services.grn_extract import (
     safe_name,
 )
 from app.services.grn_select import erp_amount, order_key, select
+from app.services.product_master import category_of
 
 # erp_cache.CACHE_ROOT 已经指向 `.cache/erp`
 DETAIL_DIR = CACHE_ROOT / "details" / "shipments"
@@ -200,8 +201,12 @@ def shipment_money() -> ShipmentMoney:
                 rmb = dec(row.get("出运采购金额(RMB)"))
                 rmb_by_po[code] += rmb
                 usd_by_po[code] += dec(row.get("出运金额"))
-                kind = str(row.get("海关商品（中文）") or "").strip()
-                if kind:
+                # 拆单的「产品类型」现在是商品资料粗分类（如 法兰/管件/无缝管），
+                # 这里同时登记「细分品名」和「粗分类」两个键，规则②的兜底两种写法都能命中。
+                kinds = {str(row.get("海关商品（中文）") or "").strip()}
+                kinds.add(category_of(str(row.get("产品编码") or "").strip()))
+                kinds.discard("")
+                for kind in kinds:
                     rmb_by_kind[(code, kind)] += rmb
     _MONEY = ShipmentMoney(
         rmb_by_po=dict(rmb_by_po), rmb_by_kind=dict(rmb_by_kind), usd_by_po=dict(usd_by_po)
