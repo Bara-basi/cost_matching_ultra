@@ -33,8 +33,9 @@ def save_ref(name: str, payload) -> None:
 
 def main() -> None:
     client = FeishuClient()
-    app = get_config("MT_FINANCE_AI_TBALE_APP_TOKEN")
-    table = get_config("MT_FINANCE_AI_TABLE_ID")
+    # 取的是「2026年海关AI副本」那套表（.env 里 COPY 那两个键）
+    app = get_config("MT_FINANCE_AI_COPY_APP_TOKEN")
+    table = get_config("MT_FINANCE_AI_COPY_TABLE_ID")
     save("records_ai", list(client.iter_records(app, table)))
     save("t_customs2026", list(client.iter_records(app, CUSTOMS_TABLE)))
     save_ref("ai_fields", client.list_fields(app, table))

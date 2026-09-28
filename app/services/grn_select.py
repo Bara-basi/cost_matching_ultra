@@ -29,6 +29,7 @@ from typing import Any
 from app.services.erp_cache import CACHE_ROOT
 from app.services.grn_extract import (
     PARSED_ROOT,
+    blocks_to_amounts,
     normalize_settled,
     safe_name,
     to_decimal,
@@ -245,11 +246,6 @@ class Item:
 
 def core(text: str) -> str:
     return re.sub(r"[^0-9A-Z]", "", str(text or "").upper())
-
-
-def strip_year(text: str) -> str:
-    """去掉 25MT/26MT 这类年份前缀，便于跨年比对。"""
-    return re.sub(r"^\d{2}MT", "MT", core(text))
 
 
 def same_order(attachment_name: str, purchase_code: str) -> bool:
@@ -526,11 +522,6 @@ def line_key(line: dict) -> tuple | None:
     return (_norm_text(material), _norm_text(name), _norm_text(spec), _norm_text(qty), _norm_text(unit))
 
 
-def line_signature(payload: dict[str, Any]) -> tuple:
-    """兼容旧口径：把身份集合转成可比较的元组。"""
-    return tuple(sorted(line_identity(payload)))
-
-
 def batch_set(payload: dict[str, Any]) -> set[str]:
     """文件里**真正有金额**的批次集合（用于识别「递进快照」）。"""
     out: set[str] = set()
@@ -563,35 +554,7 @@ def block_amounts(payload: dict[str, Any]) -> collections.Counter:
 
 def block_token_amounts(payload: dict[str, Any]) -> dict[str, Decimal]:
     """批次记号 → 金额（同一份表里重复且不同的记号视为不唯一，跳过）。"""
-    out: dict[str, Decimal] = {}
-    ambiguous: set[str] = set()
-    seen: dict[str, Decimal] = {}
-    for block in payload.get("settled_blocks") or []:
-        if not isinstance(block, dict):
-            continue
-        token = _batch_of_label(str(block.get("label") or ""))
-        amount = to_decimal(block.get("amount"))
-        if not token or not amount:
-            continue
-        if token in seen and seen[token] != amount:
-            ambiguous.add(token)
-        seen[token] = amount
-        out[token] = amount
-    for token in ambiguous:
-        out.pop(token, None)
-    return out
-
-
-def _batch_of_label(label: str) -> str:
-    text = str(label or "").strip().upper()
-    if not text or "+" in text or "&" in text:
-        return ""
-    chinese = re.search(r"第([一二三四五六七八九十\d]+)批", text)
-    if chinese:
-        return "第" + chinese.group(1) + "批"
-    cleaned = re.sub(r"[\d\./\s\-_]+", " ", text)
-    letters = re.findall(r"(?<![A-Z])([A-Z])(?![A-Z])", cleaned)
-    return letters[-1] if letters else ""
+    return blocks_to_amounts(payload.get("settled_blocks") or [])
 
 
 def block_values(payload: dict[str, Any]) -> list[Decimal]:

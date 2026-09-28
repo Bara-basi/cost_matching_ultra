@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import re
+import collections
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -67,6 +68,12 @@ JSON 结构：
 - `weight` 只在单据真的给了重量（KG/净重/理算重量）时填。
 - `prepaid` 是备注里写的预付款；`payable_now` 是「本次付款/本次付尾款」。
 - `extra_fees` 收单据里没有数量单价的纯费用行（包装费/木箱费/渗透实验费…）。
+- **合计行下方的批注要逐行看**，两类都要收：
+  ① 加项（「补款/补差/另加/另收 …」+ 木箱费/样品费/坡口费/吊绳…）→ `extra_fees` 填**正数**；
+  ② **抵扣项**（「抵扣/扣款/扣减/冲减/减免/扣除/退回 …」，常见「抵扣运费与试验费用：1109」）
+     → `extra_fees` 填**负数**（如实抄下来，不要丢）。
+  实例：25MT-07F591-GYL 合计 170,213.04、表尾「抵扣运费与试验费用：1109」，
+  实发 = 169,104.04（可用同页「本次付尾款 135,104.04 = 实发 − 预付款 34,000」交叉验证）。
 - **一张表里有多个「实发数据-A / -B / -C」区块时**（一个文件覆盖多个发货批次），
   请**逐区块**把「合计行里该区块的金额」填进 `settled_blocks`（label 照抄区块名），
   `settled_totals.amount` 填这些区块金额之和；没有多区块时 `settled_blocks` 就一个元素。
@@ -137,6 +144,52 @@ def is_number_cell(text: str) -> bool:
     return bool(NUMERIC_CELL.match(text.replace(" ", "")))
 
 
+# --------------------------------------------------------------- 批次区块（解析/选单/成本三处共用）
+
+
+def block_batch(label: str) -> str:
+    """从「实发数据-A」「第2批」这类区块名里认出批次记号。
+
+    合并区块（`A+B`、`A&B`）含义不唯一，一律返回空串。
+    这是入库单区块名 → 批次记号的**唯一实现**：附件解析、选单（去旧版）、
+    成本分摊（按批次直取）三处都调它，避免同一套规则三份写法各自漂移。
+    """
+    text = str(label or "").strip().upper()
+    if not text or "+" in text or "&" in text:
+        return ""
+    chinese = re.search(r"第([一二三四五六七八九十\d]+)批", text)
+    if chinese:
+        return "第" + chinese.group(1) + "批"
+    cleaned = re.sub(r"[\d\./\s\-_]+", " ", text)
+    letters = re.findall(r"(?<![A-Z])([A-Z])(?![A-Z])", cleaned)
+    return letters[-1] if letters else ""
+
+
+def blocks_to_amounts(blocks: list[dict[str, Any]]) -> dict[str, Decimal]:
+    """实发区块列表 → {批次记号: 金额}。
+
+    同一份表里同一个记号出现两次且金额不同（供应商把两个区块都写成 `实发数据-B`）
+    时，这个记号含义不唯一，**不放进映射**，避免按批次直取取错。
+    """
+    out: dict[str, Decimal] = {}
+    seen: dict[str, Decimal] = {}
+    ambiguous: set[str] = set()
+    for block in blocks or []:
+        if not isinstance(block, dict):
+            continue
+        token = block_batch(block.get("label"))
+        amount = to_decimal(block.get("amount"))
+        if not token or not amount:
+            continue
+        if token in seen and seen[token] != amount:
+            ambiguous.add(token)
+        seen[token] = amount
+        out[token] = amount
+    for token in ambiguous:
+        out.pop(token, None)
+    return out
+
+
 def line_amounts(payload: dict[str, Any]) -> Decimal:
     """明细行的金额求和（rule 与 llm 两种结构都认）。"""
     total = Decimal(0)
@@ -158,6 +211,64 @@ def line_amounts(payload: dict[str, Any]) -> Decimal:
         if value is not None:
             total += value
     return total
+
+
+# ---- 数量核验（2026-09-28 新增）------------------------------------------------
+# 「出运数量不能比入库数量多」的核验要按**单位**对齐：入库单里的数量列五花八门
+# （数量 个 / 数量只 / 数量 PC / 数量 米 / KG…），先把列名归到三个"单位族"里再比。
+COUNT_UNITS = {
+    "ea", "pc", "pcs", "pce", "each", "piece", "set",
+    "个", "只", "支", "件", "根", "套", "片", "条",
+}
+LENGTH_UNITS = {"m", "mtr", "mtrs", "meter", "metre", "米", "ft", "inch", "英寸"}
+WEIGHT_UNITS = {"kg", "kgs", "千克", "公斤", "ton", "tons", "t", "lb", "磅", "克", "g"}
+_QTY_COLUMN_HINT = ("数量", "支数", "只数", "件数", "个数", "米数", "重量", "kg", "KG")
+_QTY_COLUMN_SKIP = ("单价", "金额", "总价", "备注")
+
+
+def unit_family(text: Any) -> str:
+    """把单位/列名归到 count / length / weight，认不出返回空串。"""
+    key = re.sub(r"[（）()#\d]", " ", str(text or ""))
+    parts = [part for part in key.replace("/", " ").split() if part]
+    for part in reversed(parts):
+        token = part.strip().lower()
+        if token in COUNT_UNITS:
+            return "count"
+        if token in LENGTH_UNITS:
+            return "length"
+        if token in WEIGHT_UNITS:
+            return "weight"
+    return ""
+
+
+def line_quantities(payload: dict[str, Any]) -> dict[str, Decimal]:
+    """这份入库单的明细数量，**按单位族求和**：{"count": 6, "length": 294, "weight": 1282.5}。
+
+    同一行里常有多个同族数量列（`数量 个` / `数量只` / `数量 个#2`…），它们写的是同一个数，
+    所以每行、每族**只取最大值**再加总，避免重复计数。
+    """
+    totals: dict[str, Decimal] = collections.defaultdict(Decimal)
+    for line in payload.get("lines") or []:
+        if not isinstance(line, dict):
+            continue
+        best: dict[str, Decimal] = {}
+        for label, raw in line.items():
+            text = str(label)
+            if any(skip in text for skip in _QTY_COLUMN_SKIP):
+                continue
+            if not any(hint in text for hint in _QTY_COLUMN_HINT):
+                continue
+            family = unit_family(text)
+            if not family:
+                continue
+            value = to_decimal(raw)
+            if value is None:
+                continue
+            if value > best.get(family, Decimal(0)):
+                best[family] = value
+        for family, value in best.items():
+            totals[family] += value
+    return dict(totals)
 
 
 # --------------------------------------------------------------------------- 规则解析
@@ -379,7 +490,14 @@ def parse_template(attachment: Attachment) -> RuleResult:
     if marker_index is not None:
         for col, cell in enumerate(grid[marker_index]):
             # 区块名不一定是「实发数据」，也可能是「中通发溪流实发数据-裸管」「06H192A实发数据」
-            if cell.startswith("实发") or "实发数据" in cell or "实发总重" in cell:
+            # 或「实际数据」（实测 25MT-07F591-GYL 的回签件就写「实际数据」）
+            if (
+                cell.startswith("实发")
+                or "实发数据" in cell
+                or "实发总重" in cell
+                or cell.startswith("实际数据")
+                or "实际发货" in cell
+            ):
                 starts.append((col, cell))
     order_start = None
     if marker_index is not None:
@@ -448,6 +566,13 @@ def parse_template(attachment: Attachment) -> RuleResult:
     #      正是飞书比我方多的那 27,079；25MT-06H133 的「补款 8820」已经在它的合计里，
     #      行内没有费用词，因此不会被重复计入。
     TAIL_KEYWORDS = ("补款", "补差", "另加", "另收", "补收")
+    # 表尾「抵扣类」批注：合计算的是货值，但实际付款时被扣掉了（运费/试验费/退货/过磅差…），
+    # 实发要**减去**它。实例 25MT-07F591-GYL：「抵扣运费与试验费用：1109」，
+    # 合计 170,213.04 − 1,109 = 169,104.04，与飞书分毫一致
+    # （同一条还有「本次付尾款 135,104.04」= 169,104.04 − 预付款 34,000，可交叉验证）。
+    DEDUCT_KEYWORDS = ("抵扣", "扣款", "扣减", "冲减", "减免", "扣除", "减掉", "退回")
+    # 付款类词（预付款/尾款/已付…）：出现在同一行时，说明它是**付款说明**而不是费用扣减
+    PAYMENT_WORDS = ("预付款", "预付", "尾款", "已付", "付款", "定金", "订金", "货款", "本次付")
     COST_WORDS = (
         "木箱", "样品", "样管", "试样", "坡口", "绳子", "吊绳", "包装", "加工",
         "成品", "价格", "运费", "装卸", "实验", "检测",
@@ -485,6 +610,64 @@ def parse_template(attachment: Attachment) -> RuleResult:
             )
             tail_cost += amount
 
+    # ---- 表尾抵扣：从合计里**减掉**（负向费用），同样在 extra_fees / tail_notes 留痕
+    deduct_total = Decimal(0)
+    for index in range(last_total + 1, footer_start):
+        row = grid[index]
+        joined = " ".join(cell for cell in row if cell)
+        if not joined or "制单" in joined or "审核" in joined:
+            continue
+        if not any(word in joined for word in DEDUCT_KEYWORDS):
+            continue
+        # 只认**费用性质的抵扣**（抵扣运费/试验费/木箱费…）。
+        # 「本次预付款抵扣 159,223.75」这类是付款信息（预付款/尾款/已付），
+        # 口径上不进成本——动了它反而把成本算错（26MT-06M087 就这么被扣掉过 15.9 万）。
+        if not any(word in joined for word in COST_WORDS):
+            tail_notes.append({"label": joined[:80], "amount": None, "row": index + 1})
+            continue
+        if any(word in joined for word in PAYMENT_WORDS):
+            tail_notes.append({"label": joined[:80], "amount": None, "row": index + 1})
+            continue
+        amount = None
+        key_col = next(
+            (col for col, cell in enumerate(row)
+             if cell and any(word in cell for word in DEDUCT_KEYWORDS)),
+            None,
+        )
+        # ① 先看关键词右侧的独立数字单元格
+        if key_col is not None:
+            for cell in row[key_col + 1:]:
+                if cell and is_number_cell(str(cell).strip()):
+                    value = to_decimal(cell)
+                    if value:
+                        amount = value
+                        break
+        # ② 金额常写在**同一个单元格的文字里**（「抵扣运费与试验费用：1109」）→ 取冒号后/
+        #    文本里最后一段数字（排除 2026.4.23 这类日期）
+        if amount is None:
+            text = str(row[key_col] if key_col is not None else joined)
+            tail = re.split(r"[:：]", text)[-1] if re.search(r"[:：]", text) else text
+            numbers = re.findall(r"\d+(?:[.,]\d+)?", tail)
+            for token in reversed(numbers):
+                if re.fullmatch(r"20\d{2}", token):  # 年份不算金额
+                    continue
+                value = to_decimal(token)
+                if value:
+                    amount = value
+                    break
+        if amount is None:
+            continue
+        if any(note.get("label") == joined[:80] for note in tail_notes):
+            continue  # 上面补款分支已经记过这一行
+        deduct_total += amount
+        extra_fees.append(
+            {"label": f"表尾抵扣：{joined[:60]}", "amount": dec_str(-amount)}
+        )
+        tail_notes.append(
+            {"label": joined[:80], "amount": dec_str(-amount), "row": index + 1}
+        )
+    tail_cost -= deduct_total
+
     if tail_cost:
         # 作为一条独立区块参与下游合计（区块标签不含批次字母，不会被误当批次）
         settled_blocks.append(
@@ -506,7 +689,11 @@ def parse_template(attachment: Attachment) -> RuleResult:
         if qty_value is not None:
             settled_qty_sum += qty_value
     if settled_sum:
-        settled_amount = dec_str(settled_sum + tail_cost)
+        # 表尾补款/抵扣已经作为独立区块（label="表尾补款"）计进 settled_blocks 了，
+        # 这里**不能再加一次** tail_cost——曾经两边各加一次，金额被放大了整整一笔
+        # （实测 26MT-06M087 多 27,079、25MT-07V034-JX 多 19,569.6、
+        #   25MT-08C355B-MJ 多 2,933.5、25MT-07F591-GYL 多 1,109）。
+        settled_amount = dec_str(settled_sum)
     else:
         settled_amount = (
             dec_str((to_decimal(order_amount) or Decimal(0)) + tail_cost)
@@ -536,7 +723,7 @@ def parse_template(attachment: Attachment) -> RuleResult:
                     prepaid = numbers[0]
     for row in grid[data_start:stop]:
         if any(cell.startswith("备注") for cell in row) and not notes:
-            notes = " ".join(cell for cell in row if cell if cell)
+            notes = " ".join(cell for cell in row if cell)
 
     payload = {
         "doc_type": "入库单",
@@ -568,7 +755,7 @@ def parse_template(attachment: Attachment) -> RuleResult:
         "source": "rule",
     }
 
-    problems, order_notes = _validate(payload, labels)
+    problems, order_notes = _validate(payload)
     payload["anomalies"] = problems + order_notes
     return RuleResult(not problems, payload, "；".join(problems))
 
@@ -602,7 +789,7 @@ def _row_amount(row: list[str], labels: list[str]) -> Decimal | None:
     return best
 
 
-def _validate(payload: dict[str, Any], labels: list[str]) -> tuple[list[str], list[str]]:
+def _validate(payload: dict[str, Any]) -> tuple[list[str], list[str]]:
     """校验明细与合计是否闭合；返回（阻断问题, 提示性说明）。
 
     允许「合计 = 明细求和 + 表内费用行」——包装费/木箱费/补款这类增量
@@ -726,7 +913,14 @@ def parse_with_model(
                 f"{hint}\n"
                 f"下面是该附件的表格内容（rN 表示第 N 行）：\n\n{body}"
             )
-            images = []
+            # 表格里嵌了扫描件/批注截图时一并给模型看：合计下边的「抵扣/补款」批注、
+            # 手写改动经常只出现在图里（实测 26MT-07T265 这类回签件就是）
+            images = list(attachment.embedded)
+            if images:
+                prompt += (
+                    f"\n\n（另附该 Excel 内嵌的 {len(images)} 张图片，"
+                    "请以图片里的金额与批注为准，尤其注意合计行下方的抵扣/补款说明。）"
+                )
     elif attachment.kind == "image":
         prompt = (
             f"采购单号（睿贝档案，仅作参考）：{purchase_code}\n"

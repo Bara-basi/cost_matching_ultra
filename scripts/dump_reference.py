@@ -50,7 +50,8 @@ def fetch(app_token: str) -> None:
 
 
 def main() -> None:
-    app_token = get_config("MT_FINANCE_AI_TBALE_APP_TOKEN")
+    # 字典表（产品类型/供应商/退税率/汇率…）都在「2026年海关AI副本」这个 app 下
+    app_token = get_config("MT_FINANCE_AI_COPY_APP_TOKEN")
     fetch(app_token)
     print(f"输出目录 {OUT_DIR}")
 

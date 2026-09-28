@@ -23,8 +23,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.services.feishu_client import FeishuClient, get_config  # noqa: E402
 
-APP_TOKEN = get_config("MT_FINANCE_AI_TBALE_APP_TOKEN")
-TABLE_ID = get_config("MT_FINANCE_AI_TABLE_ID")
+APP_TOKEN = get_config("MT_FINANCE_AI_COPY_APP_TOKEN")
+TABLE_ID = get_config("MT_FINANCE_AI_COPY_TABLE_ID")
 RAW_DIR = PROJECT_ROOT / "data" / "raw" / "customs_declaration"
 CACHE = PROJECT_ROOT / "data" / "cache"
 MANIFEST = CACHE / "customs_pdf_manifest.json"

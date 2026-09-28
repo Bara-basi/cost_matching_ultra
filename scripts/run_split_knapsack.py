@@ -19,7 +19,7 @@ import json
 import re
 import sys
 from collections import defaultdict
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 from decimal import Decimal
 from pathlib import Path
@@ -69,8 +69,106 @@ from app.services.supplier_names import SupplierNames  # noqa: E402
 CACHE = PROJECT_ROOT / "data" / "cache"
 REF_PATH = CACHE / "records_full_match_ref.json"
 OUT_DIR = PROJECT_ROOT / "outputs" / "shipments_split"
+# 拆单输入 = 报关单解析结果（出口退税联）
+PARSE_XLSX = PROJECT_ROOT / "outputs" / "customs_parse" / "报关单解析结果_出口退税联.xlsx"
+# 已知 PDF 解析不全导致单号错误的两条，直接过滤
+BAD_CONTRACTS = {
+    "26mt-03p200y-a&229y-a&245y-a&",
+    "26mt-03p200y-a&229y-a&245y-a&262",
+}
+
+
+@dataclass(frozen=True)
+class DeclaredLine:
+    """一条报关商品行（拆单的输入）。"""
+
+    source_file: str
+    contract: str
+    declaration_no: str
+    product_name: str
+    hs_code: str
+    weight: Decimal
+    amount: Decimal
+    currency: str = ""
+    product_type: str = ""
+
+
+def flatten(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        return " | ".join(filter(None, (flatten(item) for item in value)))
+    if isinstance(value, dict):
+        for key in ("text", "name", "value"):
+            if key in value:
+                return flatten(value[key])
+    return ""
+
+
+def read_declared() -> list[DeclaredLine]:
+    """读报关单解析结果 → 报关商品行（含去重与「超范围合同号」二次拦截）。"""
+    from openpyxl import load_workbook
+
+    from app.services.scope import out_of_scope_reason
+
+    workbook = load_workbook(PARSE_XLSX, read_only=True)
+    sheet = workbook.active
+    rows = list(sheet.iter_rows(values_only=True))
+    workbook.close()
+    header = [str(cell) for cell in rows[0]]
+    index = {name: position for position, name in enumerate(header)}
+    lines: list[DeclaredLine] = []
+    seen: set[tuple] = set()
+    for row in rows[1:]:
+        def cell(name: str) -> Any:
+            position = index.get(name)
+            return row[position] if position is not None and row[position] is not None else ""
+
+        contract = str(cell("合同号_1")).strip()
+        if not contract or contract.lower() in BAD_CONTRACTS:
+            continue
+        if out_of_scope_reason(contract):
+            continue
+        weight = str(cell("报关重量") or 0).replace(",", "") or "0"
+        declared = str(cell("总价") or 0).replace(",", "") or "0"
+        try:
+            weight_value = Decimal(weight)
+        except Exception:  # noqa: BLE001
+            weight_value = Decimal(0)
+        try:
+            amount_value = Decimal(declared)
+        except Exception:  # noqa: BLE001
+            amount_value = Decimal(0)
+        # 同一张报关单在 data/raw 下有重复 PDF 时会产生重复行：按
+        # 「报关单号 + 合同号 + 品名 + 重量 + 金额」判重，只保留第一条
+        marker = (str(cell("报关单号")), contract, str(cell("报关品名")), weight, declared)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        lines.append(
+            DeclaredLine(
+                source_file=str(cell("来源文件")),
+                contract=contract,
+                declaration_no=str(cell("报关单号")),
+                product_name=str(cell("报关品名")),
+                hs_code=str(cell("海关编码")),
+                weight=weight_value,
+                amount=amount_value,
+                currency=str(cell("币种")),
+                product_type=str(cell("产品类型") or ""),
+            )
+        )
+    return lines
 # 报关金额与 ERP 出运金额之间允许的舍入差（0.5 元）
 TOLERANCE_CENTS = 50
+# 「小于 1 个货币单位的补充差额忽略不计」（2026-09-28 用户口径）：业务为了把
+# 报关金额与出运金额抹平，会手工补一笔 ≤1 个货币单位的客户费用（如 0.01）。
+# 这种零头不参与"齐不齐"的比较——定向兜底里「一组货 ↔ 多张报关行」的金额核对也按它放宽。
+IGNORABLE_DIFF_CENTS = 100
 # 「极小客户费用」阈值（元）：业务上为了把报关金额与出运金额抹平，会手工补一笔
 # 很小的客户费用（如 0.01，业务确认**一定在 1 个货币单位以内**）。
 # 这类单据的金额关系是**精确**的，出现它就禁用容差。
@@ -435,13 +533,61 @@ def attempt_level(
 
 def expand(items: list, assignment: list) -> list:
     """把「组合记录」还原成真实产品行。"""
-    out = []
-    for line in assignment:
-        if line.members:
-            out.extend(line.members)
-        else:
-            out.append(line)
+    return flatten(assignment)
+
+
+def flatten(records: list) -> list:
+    """把「组合记录」摊平成真实产品行（组合记录自带 members）。"""
+    out: list = []
+    for record in records:
+        out.extend(record.members or [record])
     return out
+
+
+def _norm_cell(value: Any) -> str:
+    """单元格归一：文本压空白、数字按数值（`10` 与 `10.000000` 同一条）。"""
+    text = re.sub(r"\s+", " ", str(value or "").strip()).replace(",", "")
+    if not text:
+        return ""
+    try:
+        return f"{float(text):.6f}"
+    except ValueError:
+        return text.upper()
+
+
+def row_key(raw: dict) -> tuple:
+    """一条出运产品行的稳定身份（内容键）。
+
+    不能用 `id(raw)`：`load_lines()` 每读一次 JSON 就新建一批 dict，
+    **同一行在不同合同 / 不同候选池里是两个不同的对象**，按 id 比会把
+    「真实同一行」判成两条。文本去空白、数字按数值归一，和去重标记同一套口径。
+    """
+    return (
+        _norm_cell(raw.get("invoice_code")),
+        _norm_cell(raw.get("purchase_code")),
+        _norm_cell(raw.get("sku")),
+        _norm_cell(raw.get("amount_usd")),
+        _norm_cell(raw.get("quantity")),
+        _norm_cell(raw.get("amount_rmb")),
+        _norm_cell(raw.get("customs_name")),
+        tuple(_norm_cell(code) for code in (raw.get("order_codes") or [])),
+    )
+
+
+def twin_key(line) -> tuple:
+    """「同单孪生行」的判据：同一张出运单 + 同一采购单 + 同品名 + 同金额 + 同数量。
+
+    26MT-05X246A 的两条产品行就是这样：`26MT-05X246-1` / `26MT-05X246-2`，
+    金额、规格、数量全一样，**只有 SKU 不同**，报关单的金额只闭合得了其中一条。
+    """
+    raw = line.raw or {}
+    return (
+        _norm_cell(raw.get("invoice_code")),
+        str(line.purchase_code or ""),
+        str(line.customs_name or ""),
+        line.amount,
+        str(line.quantity),
+    )
 
 
 def hs_compatible(left: str, right: str) -> bool:
@@ -553,6 +699,10 @@ def directed_split_rows(
                 sorted({line.purchase_code for line in members if line.purchase_code})
             ),
             "出运金额合计": f"{total / 100:.2f}",
+            # 出运采购金额(RMB) 是成本匹配的分摊权重，必须和出运金额一起落下来，
+            # 否则成本匹配拿不到人民币口径，只能退回按出运金额(USD) 占比摊整单
+            # （实测 26MT-03T203Y-HX 就是这样把两张报关单摊差 5,111.09 的）。
+            "出运采购金额合计": f"{sum(line_rmb_cents(line) for line in members) / 100:.2f}",
             "报关金额": f"{declared_cents / 100:.2f}",
             "客户费用分摊": f"{(declared_cents - total) / 100:.2f}",
             "产品行数": len(members),
@@ -591,6 +741,9 @@ def directed_split_rows(
                     "供应商": items[0].supplier,
                     "采购单号": items[0].purchase_code,
                     "出运金额合计": f"{share / 100:.2f}",
+                    "出运采购金额合计": (
+                        f"{sum(line_rmb_cents(line) for line in items) / 100:.2f}"
+                    ),
                     "报关金额": f"{allocated_cents / 100:.2f}",
                     "客户费用分摊": f"{(allocated_cents - share) / 100:.2f}",
                     "产品行数": len(items),
@@ -654,7 +807,9 @@ def directed_split_rows(
         if len(hit_rows) == 1:
             decl, row = flat[hit_rows[0]]
             target = to_cents(row.get("amount"))
-            if target and total > target * 2:
+            # 这组货明显装不下这一张报关单（>2 倍）→ 说明该组还对应别的报关单，不硬塞。
+            # 「小于 1 个货币单位」的零头不算"装不下"。
+            if target and total > target + IGNORABLE_DIFF_CENTS and total > target * 2:
                 continue
             rows.extend(emit_grouped(decl, row, key, members, total))
             continue
@@ -664,7 +819,13 @@ def directed_split_rows(
         if not all(targets):
             return [], f"{key} 命中多行但报关金额缺失"
         summary = sum(targets)
-        if summary <= 0 or abs(total - summary) / summary > 0.02:
+        # 「小于 1 个货币单位的补充差额忽略不计」（2026-09-28 用户口径）：
+        # 实测 26MT-01P242Y-C 的两张无缝管报关行合计 71,293.68、出运单这一组的货
+        # 71,293.67，只差 0.01 USD —— 这种零头不该挡住拆分。
+        if summary <= 0 or (
+            abs(total - summary) > IGNORABLE_DIFF_CENTS
+            and abs(total - summary) / summary > 0.02
+        ):
             return [], (
                 f"{key} 命中多行（{len(hit_rows)}）但金额合计对不上"
                 f"（{total / 100:.2f} vs {summary / 100:.2f}）"
@@ -739,8 +900,6 @@ def main() -> None:
     parser.add_argument("--only", default="", help="只跑这些合同（逗号分隔）")
     parser.add_argument("--debug", action="store_true", help="打印逐合同的求解诊断")
     args = parser.parse_args()
-
-    from scripts.run_split import read_declared
 
     declared = read_declared()
     if args.only:
@@ -883,6 +1042,11 @@ def main() -> None:
         return merged
     split_rows: list[dict] = []
     failures: list[dict] = []
+    # 「出运单里有、但没有任何报关单认领」的产品行（以前是静默丢弃）
+    pool_rows_all: dict[int, tuple[str, Any]] = {}
+    claimed_rows_all: set[int] = set()
+    claimed_twins_all: set[tuple] = set()
+    extra_rows_all: dict[tuple, str] = {}   # 已按「孪生行」补记成本的产品行 → 合同号
     strategy_log: list[dict] = []
     # 报关单号 -> 该单实际装到的 ERP 产品类别（用于「混装报关」的比对放行）
     decl_products: dict[str, set[str]] = defaultdict(set)
@@ -1186,6 +1350,33 @@ def main() -> None:
             }
         )
 
+        # 该合同最终采用的出运产品行池。下面这个循环里 `items` 会被按「采购单+产品类型」
+        # 重新赋值，要留住池子本身，做完之后才能查「有没有行没被认领」。
+        split_any = any(result.assignments.get(decl) for decl in decls)
+        pool_items = list(items)
+        # —— 同一出运单里「只差 SKU」的孪生产品行 ——
+        # 报关单金额只能闭合其中一条时，另一条既没有报关单认领、也不会报错，
+        # 于是整张采购单只算了一半成本（26MT-05X246A：PI-26MT-05X246A 有两条 24,300 的
+        # 产品行，报关单 223320260001297365 只闭合了一条，飞书按整单 48,600 给钱）。
+        # 处理：只在「已经有一条同出运单 / 同采购单 / 同品名 / 同金额 / 同数量的行被这张
+        # 合同的记录认领」时，把剩下那条作为**成本补记行**并进同一条记录：
+        # `出运金额`、`报关金额` 一点不动（那是报关单原件上的事实），只把它的
+        # `出运采购金额(RMB)` 加进成本，并在「补记成本」列写明。
+        extra_cost: dict[tuple, list] = {}
+        if split_any and not ambiguous and not directed_by_decl:
+            claimed_lines = [
+                line
+                for _solution in (result.assignments or {}).values()
+                for line in flatten(_solution)
+            ]
+            claimed_rows = {row_key(line.raw) for line in claimed_lines}
+            twins = {twin_key(line) for line in claimed_lines}
+            for line in flatten(pool_items):
+                if row_key(line.raw) in claimed_rows:
+                    continue
+                if twin_key(line) in twins:
+                    extra_cost.setdefault(twin_key(line), []).append(line)
+                    extra_rows_all[row_key(line.raw)] = contract
         for decl, rows in decls.items():
             used = result.assignments.get(decl)
             if not used:
@@ -1278,6 +1469,17 @@ def main() -> None:
                     item_groups
                 ):
                     share = sum(x.amount for x in items)
+                    # 成本补记行：同出运单里「只差 SKU」、报关单闭合不了也没人认领的那条，
+                    # 只进成本（出运采购金额(RMB)），不进出运金额/报关金额
+                    extra_lines: list = []
+                    extra_seen: set[tuple] = set()
+                    for line in items:
+                        for extra in extra_cost.get(twin_key(line), []):
+                            key = row_key(extra.raw)
+                            if key in extra_seen:
+                                continue
+                            extra_seen.add(key)
+                            extra_lines.append(extra)
                     if position == len(item_groups) - 1:
                         allocated_cents = declared_cents - allocated_all
                     else:
@@ -1302,12 +1504,41 @@ def main() -> None:
                             "供应商": items[0].supplier,
                             "采购单号": purchase_code,
                             "出运金额合计": f"{share / 100:.2f}",
-                            "出运采购金额合计": f"{sum(line_rmb_cents(x) for x in items) / 100:.2f}",
+                            "出运采购金额合计": f"{sum(line_rmb_cents(x) for x in items + extra_lines) / 100:.2f}",
                             "报关金额": f"{allocated_cents / 100:.2f}",
                             "客户费用分摊": f"{fee_cents / 100:.2f}",
                             "产品行数": len(items),
+                            "补记成本": "、".join(
+                                f"{extra.purchase_code} {str((extra.raw or {}).get('sku') or '')}"
+                                f" {line_rmb_cents(extra) / 100:.2f}"
+                                for extra in extra_lines
+                            ),
                         }
                     )
+
+        # —— 出运产品行有没有被「静默落下」——
+        # 报关单只认领了整张出运单的一部分时，剩下的产品行既不进记录、也不报错。
+        # 26MT-05X246A 就是这样：PI-26MT-05X246A 有两条 24,300 的产品行（SKU 只差尾号），
+        # 报关单 223320260001297365 的金额只能闭合其中一条，另一条被无声丢掉，
+        # 于是我方只有半个采购单（24,300），飞书按整单（48,600）给钱。
+        # 只在「这张合同真的拆出了记录」时才谈"落下"：多解被整单挂起或走了定向兜底的，
+        # 池子里的行本来就还没分配，不算漏（会在异常表里单独说明）。
+        if split_any and not ambiguous and not directed_by_decl:
+            for _solution in (result.assignments or {}).values():
+                for _line in flatten(_solution):
+                    claimed_rows_all.add(row_key(_line.raw))
+                    claimed_twins_all.add(
+                        (
+                            _line.purchase_code,
+                            _line.customs_name,
+                            _line.amount,
+                            str(_line.quantity),
+                        )
+                    )
+            for line in flatten(pool_items):
+                # 同一张出运单可能被两张报关单（两个合同号）共用，行会被两边都算进池子，
+                # 所以按「原始行」去重，最后统一看谁没被任何报关单认领。
+                pool_rows_all.setdefault(row_key(line.raw), (contract, line))
 
     # 与飞书比对
     # 先做一次 ERP 数据自检：供应商（编码/名称）与产品类别矛盾时，
@@ -1540,7 +1771,7 @@ def main() -> None:
     detail_columns = [
         "报关单号", "合同号_1", "报关品名", "海关编码", "产品类型",
         "供应商简称", "供应商", "采购单号", "出运金额合计", "出运采购金额合计",
-        "报关金额", "客户费用分摊", "产品行数",
+        "报关金额", "客户费用分摊", "产品行数", "补记成本",
     ]
     group_columns = [
         "报关单号", "合同号_1", "报关品名",
@@ -1551,6 +1782,46 @@ def main() -> None:
     write_rows(bad, OUT_DIR / "拆单结果_异常.xlsx", group_columns)
     write_rows(verified, OUT_DIR / "拆单结果_已核实.xlsx", group_columns)
     write_rows(missing, OUT_DIR / "拆单结果_飞书漏拆.xlsx", group_columns)
+    # 出运单里没有报关单认领的产品行（以前是静默丢弃，现在单独列表）
+    unclaimed: list[dict] = []
+    for key, (owner, line) in pool_rows_all.items():
+        if key in claimed_rows_all:
+            continue
+        raw = dict(line.raw or {})
+        unclaimed.append(
+            {
+                "合同号_1": owner,
+                "出运单": str(raw.get("invoice_code") or ""),
+                "采购单号": line.purchase_code,
+                "SKU": str(raw.get("sku") or ""),
+                "供应商": line.supplier,
+                "出运金额": f"{line.amount / 100:.2f}",
+                "出运采购金额(RMB)": raw.get("amount_rmb") or "",
+                "报关品名": line.customs_name,
+                "同单已有孪生行": (
+                    "是"
+                    if (
+                        line.purchase_code,
+                        line.customs_name,
+                        line.amount,
+                        str(line.quantity),
+                    )
+                    in claimed_twins_all
+                    else ""
+                ),
+                "处理": (
+                    f"已按孪生行规则补记成本到 {extra_rows_all[key]} 的记录"
+                    if key in extra_rows_all
+                    else ""
+                ),
+            }
+        )
+    write_rows(
+        unclaimed,
+        OUT_DIR / "拆单_未认领产品行.xlsx",
+        ["合同号_1", "出运单", "采购单号", "SKU", "供应商", "出运金额",
+         "出运采购金额(RMB)", "报关品名", "同单已有孪生行", "处理"],
+    )
     # 费用分摊台账：逐种费用记录命中的分摊口径
     report_dir = PROJECT_ROOT / ".cache" / "erp" / "reports"
     report_dir.mkdir(parents=True, exist_ok=True)
