@@ -22,6 +22,8 @@ SHIPMENT_DETAIL_DIR = CACHE_ROOT / "details" / "shipments"
 
 TOKEN_SPLIT = re.compile(r"[;&,，、]")
 ORDER_RE = re.compile(r"(\d{2}MT-\d{2}[A-Z]\d{3}[A-Za-z0-9\-]*)", re.IGNORECASE)
+# 订单核心（含佣金 Y 与 -ADDn 尾缀）；核心之外的字母就是报关单点明的**批次**
+CORE_RE = re.compile(r"^(\d{2}MT-\d{2}[A-Z]\d{3}Y?(?:-?ADD\d*)?)", re.IGNORECASE)
 
 
 def _safe(text: str) -> str:
@@ -75,6 +77,21 @@ def rows_for_order(invoice_code: str, order_code: str) -> list[dict[str, Any]]:
         for row in detail.get("productList") or []
         if target in {strip_pi(x) for x in row_orders(row)}
     ]
+
+
+def names_batch(contract: Any) -> bool:
+    """合同号里是否点明了批次 / 尾缀（`26MT-03R036F`、`25MT-03P495Y-ADD1-A`）。
+
+    核心（年份+MT+部门+业务员+流水[Y][-ADDn]）之外的字母就是批次记号。
+    `26MT-03R036F` → True；`26MT-03R302`（没写批次）→ False。
+    """
+    from app.services.contract_shipments import literal_parts
+
+    for part in literal_parts(contract):
+        match = CORE_RE.match(strip_pi(part))
+        if match and canonical(part) != canonical(match.group(1)):
+            return True
+    return False
 
 
 def iter_shipment_details() -> list[dict[str, Any]]:
@@ -164,7 +181,13 @@ def shipment_invoices_for_contract(contract: str, *, use_map: bool = True) -> li
         elif base and base in {base_code(c) for c in codes if c}:
             if invoice not in fuzzy:
                 fuzzy.append(invoice)
-    # 精确命中优先；没有精确命中才用基号兜底
+    # 精确命中优先；没有精确命中才用基号兜底。
+    # 但合同号里**已经点明批次**（`26MT-03R036F`）时不能兜底：同一订单的其它批次是另一批货，
+    # 拿它们顶替等于把成本算成别的批次的（实测 26MT-03R036F 被 A–E 五批共 279 行顶替，
+    # 56 美元的报关行被凑出 325.27 元采购金额，并凭空多出 3 条「睿贝出运明细补充」行）。
+    # 只有合同号根本没写批次（`26MT-03R302`、`26MT-08C020`）时，取该订单的全部批次才是合理的。
+    if names_batch(contract):
+        return exact
     return exact or fuzzy
 
 

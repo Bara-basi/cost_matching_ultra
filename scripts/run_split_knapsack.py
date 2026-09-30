@@ -56,14 +56,18 @@ from app.services.shipment_index import (  # noqa: E402
     strip_pi,
 )
 from app.services.contract_shipments import (  # noqa: E402
+    container_shipments,
     cores_of,
     expand_contract,
     line_cores,
     literal_parts,
     lookup_original_by_parts,
+    order_core,
+    shipments as shipment_refs,
 )
 from app.services.shipment_detail import (  # noqa: E402
     ensure_shipment_detail,
+    names_batch,
     shipment_invoices_for_contract,
 )
 from app.services.shipment_index import normalise_purchase_code  # noqa: E402
@@ -112,13 +116,13 @@ def flatten(value: Any) -> str:
     return ""
 
 
-def read_declared() -> list[DeclaredLine]:
+def read_declared(parse_xlsx: Path | None = None) -> list[DeclaredLine]:
     """读报关单解析结果 → 报关商品行（含去重与「超范围合同号」二次拦截）。"""
     from openpyxl import load_workbook
 
     from app.services.scope import out_of_scope_reason
 
-    workbook = load_workbook(PARSE_XLSX, read_only=True)
+    workbook = load_workbook(parse_xlsx or PARSE_XLSX, read_only=True)
     sheet = workbook.active
     rows = list(sheet.iter_rows(values_only=True))
     workbook.close()
@@ -406,6 +410,23 @@ def allocate_weight(
 # 报关金额 ≈ 出运单出运总金额 的容差（分）：实测只差 1 分（26MT-03P074Y-B
 # 报关 48840.75 vs 出运单 48840.74），留一点点余量但不至于认错单
 AMOUNT_MATCH_CENTS = 5
+
+_ADD_SUFFIX_RE = re.compile(r"-?ADD\d*", re.IGNORECASE)
+
+
+def order_family(code: Any) -> str:
+    """订单家族键：订单核心去掉**年份前缀**与 **-ADDn 尾缀**。
+
+    「按报关金额认领出运单」只在这个家族内认：
+    实测需要认的情况是同一张订单的不同写法（合同 `25MT-03P495Y-ADD1-A` 对应出运单
+    `25MT-03P495Y-B`：年份 25MT/26MT、批次字母、ADD 都可能写得不一致）；
+    绝不允许跨订单认——`26MT-03P315B`（400 美元）曾认到毫不相关的
+    `25MT-03T614`（出运总金额恰巧也是 400 美元），成本被算成 ¥751.20。
+    """
+    core = order_core(code) or strip_pi(code)
+    if core[:2].isdigit():
+        core = core[2:]
+    return _ADD_SUFFIX_RE.sub("", core)
 
 
 def shipment_totals() -> dict[str, int]:
@@ -1074,15 +1095,18 @@ def line_rmb_cents(line) -> int:
     return cents
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--only", default="", help="只跑这些合同（逗号分隔）")
-    parser.add_argument("--debug", action="store_true", help="打印逐合同的求解诊断")
-    args = parser.parse_args()
-
-    declared = read_declared()
-    if args.only:
-        want = [x.strip() for x in args.only.split(",") if x.strip()]
+def run(
+    parse_xlsx: Path | None = None,
+    out_dir: Path | None = None,
+    only: str = "",
+    debug: bool = False,
+) -> dict:
+    """跑一轮拆单。`parse_xlsx` / `out_dir` 可指定；`only` 是逗号分隔的合同过滤。"""
+    parse_xlsx = Path(parse_xlsx or PARSE_XLSX)
+    out_dir = Path(out_dir or out_dir)
+    declared = read_declared(parse_xlsx)
+    if only:
+        want = [x.strip() for x in only.split(",") if x.strip()]
         declared = [d for d in declared if any(w in d.contract for w in want)]
     names = SupplierNames()
 
@@ -1243,6 +1267,14 @@ def main() -> None:
         totals = shipment_totals()
         if not totals:
             return []
+        # 认领范围限定在「同一订单家族」的出运单上（年份/ADD/批次写法不一致时才靠金额认单），
+        # 否则金额巧合会把毫不相关的订单拉进来
+        families: dict[str, set[str]] = {}
+        for ref in shipment_refs():
+            if not ref.invoice:
+                continue
+            families[strip_pi(ref.invoice)] = {order_family(core) for core in ref.cores}
+        wanted = {order_family(core) for core in cores_of(contract)} - {""}
         invoices: list[str] = []
         for _decl, rows in decls.items():
             amount = sum(to_cents(row.get("amount")) for row in rows)
@@ -1252,6 +1284,7 @@ def main() -> None:
                 invoice
                 for invoice, total in totals.items()
                 if abs(total - amount) <= AMOUNT_MATCH_CENTS
+                and (not wanted or (families.get(strip_pi(invoice), set()) & wanted))
             ]
             if len(hits) != 1:
                 return []
@@ -1276,6 +1309,38 @@ def main() -> None:
         # （批次字母不同、年份写错、或出运单没写 ADD）时，按金额认领最硬。
         # 作为**并列候选**参与择优；两边都没其它数据时它就是唯一的池子。
         amount_lines = collect_by_declared_amount(contract, decls)
+        # 报关单点明了批次（`26MT-03R036F`），但睿贝里没有这批出运单、金额也认领不到出运单时，
+        # 不能再拿同订单的其它批次顶替：那是另一批货，成本会算成别人的
+        # （实测 26MT-03R036F 被 A–E 五批 279 行顶替，56 美元的报关行凑出 325.27 元成本）。
+        # 直接报异常，让财务去核对合同号或等出运单生成。
+        if names_batch(contract) and not (map_invoices or legacy_invoices or amount_lines):
+            siblings = sorted(
+                {
+                    row.invoice
+                    for row in container_shipments(contract)
+                    if row.invoice
+                }
+            )
+            core = order_core(contract) or strip_pi(contract)
+            batches = []
+            for invoice in siblings:
+                text = strip_pi(invoice)
+                suffix = text[len(core) :].strip("-_ ") if text.startswith(core) else ""
+                batches.append(suffix or invoice)
+            note = f"睿贝里没有这张出运单（{contract}）"
+            if batches:
+                note += "，该订单只有 " + "/".join(batches) + " 批"
+            for decl, rows in decls.items():
+                for row in rows:
+                    failures.append(
+                        {
+                            "报关单号": decl,
+                            "合同号_1": contract,
+                            "报关品名": row.get("name"),
+                            "比对结果": note,
+                        }
+                    )
+            continue
         narrow = map_lines or legacy_lines or amount_lines or wide
         candidates: list[tuple[str, list[dict]]] = []
 
@@ -1305,7 +1370,7 @@ def main() -> None:
             candidates.append(("出运单直取（覆盖/基号兜底）", legacy_lines))
         if not candidates or len(wide) > len(narrow):
             candidates.append(("订单全量兜底", wide))
-        if args.debug:
+        if debug:
             print(
                 f"[debug] {contract} 出运产品行 窄={len(narrow)} 宽={len(wide)} "
                 f"出运单={sorted({str(x.get('invoice_code') or '') for x in narrow})}",
@@ -1354,7 +1419,7 @@ def main() -> None:
                     decls, items, fees, freight, tolerance, fee_directions(invoices)
                 )
                 attempts[level_name] = info
-                if args.debug:
+                if debug:
                     print(
                         f"[level] {contract} {level_name} 精确={info['exact_count']}/{len(decls)} "
                         f"多解={info['mode_ambiguous']} 口径={info['combo']}",
@@ -1402,7 +1467,7 @@ def main() -> None:
                 int(info["exact_count"]),
                 sum(1 for decl in decls if info["result"].assignments.get(decl)),
             )
-            if args.debug:
+            if debug:
                 print(
                     f"[cand] {contract} {scope_label} 产品行={len(lines_raw)} "
                     f"出运单={len(invoices)} 粒度={chosen_level} 精确={info['exact_count']}/{len(decls)} "
@@ -1455,9 +1520,9 @@ def main() -> None:
                 info = fallback_info
                 items = filtered_items
         _elapsed = _time.perf_counter() - _started
-        if args.debug and _elapsed > 1.0:
+        if debug and _elapsed > 1.0:
             print(f"[slow] {contract} {_elapsed:.1f}s 池={len(narrow)}/{len(wide)}", flush=True)
-        if args.debug:
+        if debug:
             print(
                 f"[debug] {contract} 采用={scope_label} 粒度={chosen_level} "
                 f"精确={info['exact_count']}/{len(decls)} "
@@ -1480,7 +1545,7 @@ def main() -> None:
                 narrow + [row for row in wide if row not in narrow],
                 names,
                 only_decls={d for d in decls if not result.assignments.get(d)},
-                debug=args.debug,
+                debug=debug,
             )
             for d_row in d_rows:
                 directed_by_decl.setdefault(d_row["报关单号"], []).append(d_row)
@@ -1501,7 +1566,7 @@ def main() -> None:
                 )
             elif d_reason:
                 extra_directed_reason = d_reason
-        if args.debug:
+        if debug:
             if directed_by_decl:
                 print(
                     f"[directed] {contract} 定向兜底报关单="
@@ -1597,7 +1662,7 @@ def main() -> None:
                 continue
             used = expand(items, used)
             row_map = assign_to_rows(rows, used, names.short)
-            if args.debug:
+            if debug:
                 print(
                     f"[assign] {decl} 报关行="
                     + str([(r.get("name"), r.get("hs"), r.get("amount")) for r in rows])
@@ -1780,6 +1845,7 @@ def main() -> None:
                 "报关单号": row.get("报关单号"),
                 "合同号_1": row.get("合同号_1"),
                 "报关品名": product,
+                "采购单号": row.get("采购单号"),
                 "系统供应商简称": short,
                 "飞书供应商简称": "",
                 "比对结果": note,
@@ -1987,11 +2053,11 @@ def main() -> None:
         "报关单号", "合同号_1", "报关品名",
         "系统供应商简称", "飞书供应商简称", "比对结果",
     ]
-    write_rows(split_rows, OUT_DIR / "拆单明细_全部.xlsx", detail_columns)
-    write_rows(same, OUT_DIR / "拆单结果_正常.xlsx", group_columns)
-    write_rows(bad, OUT_DIR / "拆单结果_异常.xlsx", group_columns)
-    write_rows(verified, OUT_DIR / "拆单结果_已核实.xlsx", group_columns)
-    write_rows(missing, OUT_DIR / "拆单结果_飞书漏拆.xlsx", group_columns)
+    write_rows(split_rows, out_dir / "拆单明细_全部.xlsx", detail_columns)
+    write_rows(same, out_dir / "拆单结果_正常.xlsx", group_columns)
+    write_rows(bad, out_dir / "拆单结果_异常.xlsx", group_columns)
+    write_rows(verified, out_dir / "拆单结果_已核实.xlsx", group_columns)
+    write_rows(missing, out_dir / "拆单结果_飞书漏拆.xlsx", group_columns)
     # 出运单里没有报关单认领的产品行（以前是静默丢弃，现在单独列表）
     unclaimed: list[dict] = []
     for key, (owner, line) in pool_rows_all.items():
@@ -2028,7 +2094,7 @@ def main() -> None:
         )
     write_rows(
         unclaimed,
-        OUT_DIR / "拆单_未认领产品行.xlsx",
+        out_dir / "拆单_未认领产品行.xlsx",
         ["合同号_1", "出运单", "采购单号", "SKU", "供应商", "出运金额",
          "出运采购金额(RMB)", "报关品名", "同单已有孪生行", "处理"],
     )
@@ -2056,13 +2122,14 @@ def main() -> None:
                 "报关单号": row.get("报关单号"),
                 "合同号_1": row.get("合同号_1"),
                 "报关品名": row.get("报关品名"),
+                "采购单号": row.get("采购单号"),
                 "说明": row.get("比对结果"),
             }
         )
     write_rows(
         local_bad,
-        OUT_DIR / "拆单_本地异常.xlsx",
-        ["类型", "报关单号", "合同号_1", "报关品名", "说明"],
+        out_dir / "拆单_本地异常.xlsx",
+        ["类型", "报关单号", "合同号_1", "报关品名", "采购单号", "说明"],
     )
     # 费用分摊台账：逐种费用记录命中的分摊口径
     report_dir = PROJECT_ROOT / ".cache" / "erp" / "reports"
@@ -2124,10 +2191,26 @@ def main() -> None:
         "飞书漏拆": len(missing),
         "异常": len(bad),
     }
-    (OUT_DIR / "拆单统计.json").write_text(
+    (out_dir / "拆单统计.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=1), encoding="utf-8"
     )
     print(json.dumps(summary, ensure_ascii=False))
+    return summary
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--only", default="", help="只跑这些合同（逗号分隔）")
+    parser.add_argument("--parse", default="", help="报关单解析结果 xlsx（默认用固定的出口退税联）")
+    parser.add_argument("--out", default="", help="输出目录（默认 outputs/shipments_split）")
+    parser.add_argument("--debug", action="store_true", help="打印逐合同的求解诊断")
+    args = parser.parse_args()
+    run(
+        parse_xlsx=Path(args.parse) if args.parse else None,
+        out_dir=Path(args.out) if args.out else None,
+        only=args.only,
+        debug=args.debug,
+    )
 
 
 def write_rows(rows: list[dict], path: Path, columns: list[str]) -> None:

@@ -1,0 +1,450 @@
+[
+  {
+    "field_name": "合同号",
+    "type": 20
+  },
+  {
+    "field_name": "部门",
+    "type": 20
+  },
+  {
+    "field_name": "合同号_1",
+    "type": 1
+  },
+  {
+    "field_name": "是否修改订单状态",
+    "type": 3
+  },
+  {
+    "field_name": "合同号（应收表格）",
+    "type": 1
+  },
+  {
+    "field_name": "出运日期",
+    "type": 19
+  },
+  {
+    "field_name": "客户代码（中信保）",
+    "type": 20
+  },
+  {
+    "field_name": "是否申报",
+    "type": 3
+  },
+  {
+    "field_name": "款齐否",
+    "type": 20
+  },
+  {
+    "field_name": "付款条款（中国信保）",
+    "type": 20
+  },
+  {
+    "field_name": "应收未收金额",
+    "type": 20
+  },
+  {
+    "field_name": "买方英文名",
+    "type": 19
+  },
+  {
+    "field_name": "销售方式",
+    "type": 3
+  },
+  {
+    "field_name": "pdf原件",
+    "type": 17
+  },
+  {
+    "field_name": "报关单号",
+    "type": 1
+  },
+  {
+    "field_name": "出口日期",
+    "type": 5
+  },
+  {
+    "field_name": "报关品名",
+    "type": 1
+  },
+  {
+    "field_name": "海关编码",
+    "type": 1
+  },
+  {
+    "field_name": "退税率",
+    "type": 19
+  },
+  {
+    "field_name": "产品类型",
+    "type": 19
+  },
+  {
+    "field_name": "运输方式",
+    "type": 1
+  },
+  {
+    "field_name": "运费",
+    "type": 2
+  },
+  {
+    "field_name": "保费",
+    "type": 2
+  },
+  {
+    "field_name": "报关金额",
+    "type": 2
+  },
+  {
+    "field_name": "币种",
+    "type": 1
+  },
+  {
+    "field_name": "报关金额“+”“-”",
+    "type": 19
+  },
+  {
+    "field_name": "汇率",
+    "type": 19
+  },
+  {
+    "field_name": "销项税额",
+    "type": 20
+  },
+  {
+    "field_name": "不含税人民币收入",
+    "type": 20
+  },
+  {
+    "field_name": "报关金额FOB",
+    "type": 20
+  },
+  {
+    "field_name": "报关美金（FOB）",
+    "type": 20
+  },
+  {
+    "field_name": "人民币金额（FOB）",
+    "type": 20
+  },
+  {
+    "field_name": "供应商简称",
+    "type": 19
+  },
+  {
+    "field_name": "供应商",
+    "type": 19
+  },
+  {
+    "field_name": "开票日期",
+    "type": 19
+  },
+  {
+    "field_name": "报关重量",
+    "type": 2
+  },
+  {
+    "field_name": "报关重量单位",
+    "type": 1
+  },
+  {
+    "field_name": "采购金额",
+    "type": 2
+  },
+  {
+    "field_name": "调整（原材料）少“+”，多“-”",
+    "type": 2
+  },
+  {
+    "field_name": "实际成本",
+    "type": 20
+  },
+  {
+    "field_name": "备注",
+    "type": 1
+  },
+  {
+    "field_name": "国家",
+    "type": 1
+  },
+  {
+    "field_name": "调整重量",
+    "type": 1
+  },
+  {
+    "field_name": "开票数量（实际）",
+    "type": 20
+  },
+  {
+    "field_name": "调整金额",
+    "type": 1
+  },
+  {
+    "field_name": "开票金额",
+    "type": 20
+  },
+  {
+    "field_name": "进项税额",
+    "type": 20
+  },
+  {
+    "field_name": "不含税成本",
+    "type": 20
+  },
+  {
+    "field_name": "退税额",
+    "type": 20
+  },
+  {
+    "field_name": "应纳税额",
+    "type": 20
+  },
+  {
+    "field_name": "港杂费",
+    "type": 2
+  },
+  {
+    "field_name": "内陆运费含税",
+    "type": 2
+  },
+  {
+    "field_name": "运费（引用）",
+    "type": 19
+  },
+  {
+    "field_name": "检测费",
+    "type": 2
+  },
+  {
+    "field_name": "佣金比例",
+    "type": 2
+  },
+  {
+    "field_name": "佣金含税",
+    "type": 20
+  },
+  {
+    "field_name": "费用合计不含税",
+    "type": 20
+  },
+  {
+    "field_name": "整单毛利",
+    "type": 20
+  },
+  {
+    "field_name": "毛利（不含税）含退税",
+    "type": 1
+  },
+  {
+    "field_name": "毛利率（不含税）",
+    "type": 20
+  },
+  {
+    "field_name": "是否通知开票",
+    "type": 19
+  },
+  {
+    "field_name": "是否给会计",
+    "type": 1
+  },
+  {
+    "field_name": "销项开票月",
+    "type": 4
+  },
+  {
+    "field_name": "报关单数量",
+    "type": 20
+  },
+  {
+    "field_name": "月份",
+    "type": 2
+  },
+  {
+    "field_name": "汇率2（实际所属月份美元汇率）",
+    "type": 19
+  },
+  {
+    "field_name": "年份",
+    "type": 2
+  },
+  {
+    "field_name": "实际月份",
+    "type": 20
+  },
+  {
+    "field_name": "实际年份",
+    "type": 20
+  },
+  {
+    "field_name": "附件",
+    "type": 17
+  },
+  {
+    "field_name": "订单RMB不含税收入",
+    "type": 20
+  },
+  {
+    "field_name": "运保杂费合计RMB",
+    "type": 20
+  },
+  {
+    "field_name": "订单收入RMB含税💦",
+    "type": 20
+  },
+  {
+    "field_name": "业务员代码",
+    "type": 20
+  },
+  {
+    "field_name": "月份 计算ROI💦",
+    "type": 2
+  },
+  {
+    "field_name": "总监💦",
+    "type": 19
+  },
+  {
+    "field_name": "业务员💦",
+    "type": 19
+  },
+  {
+    "field_name": "业务&部门",
+    "type": 20
+  },
+  {
+    "field_name": "客户代码",
+    "type": 19
+  },
+  {
+    "field_name": "客户数💦",
+    "type": 20
+  },
+  {
+    "field_name": "订单收入含税USD💦",
+    "type": 20
+  },
+  {
+    "field_name": "提取年份💖",
+    "type": 20
+  },
+  {
+    "field_name": "订单毛利润💦",
+    "type": 20
+  },
+  {
+    "field_name": "提点数💦",
+    "type": 2
+  },
+  {
+    "field_name": "提成金额💦",
+    "type": 20
+  },
+  {
+    "field_name": "提点数引入💦",
+    "type": 19
+  },
+  {
+    "field_name": "订单号💦",
+    "type": 20
+  },
+  {
+    "field_name": "提点数💦 副本",
+    "type": 2
+  },
+  {
+    "field_name": "总监提点💦",
+    "type": 2
+  },
+  {
+    "field_name": "提成总监金额💦",
+    "type": 20
+  },
+  {
+    "field_name": "客户代码合并版",
+    "type": 20
+  },
+  {
+    "field_name": "客户代码全",
+    "type": 1
+  },
+  {
+    "field_name": "开票金额2",
+    "type": 2
+  },
+  {
+    "field_name": "开票差异",
+    "type": 20
+  },
+  {
+    "field_name": "查看订单款齐否的备注",
+    "type": 1
+  },
+  {
+    "field_name": "月度综合毛利率",
+    "type": 19
+  },
+  {
+    "field_name": "月度分产品毛利率",
+    "type": 19
+  },
+  {
+    "field_name": "累计分产品毛利率",
+    "type": 19
+  },
+  {
+    "field_name": "最后更新时间",
+    "type": 1002
+  },
+  {
+    "field_name": "开票通知制作",
+    "type": 3001
+  },
+  {
+    "field_name": "执行结果",
+    "type": 1
+  },
+  {
+    "field_name": "供应商简称_API查询用",
+    "type": 20
+  },
+  {
+    "field_name": "是否开票",
+    "type": 3
+  },
+  {
+    "field_name": "发票开具日期",
+    "type": 1
+  },
+  {
+    "field_name": "发票开具结果",
+    "type": 1
+  },
+  {
+    "field_name": "是否开凭证",
+    "type": 3
+  },
+  {
+    "field_name": "凭证开具日期",
+    "type": 1
+  },
+  {
+    "field_name": "凭证开具结果",
+    "type": 1
+  },
+  {
+    "field_name": "客户名称_脚本用",
+    "type": 20
+  },
+  {
+    "field_name": "客户编码_脚本用",
+    "type": 20
+  },
+  {
+    "field_name": "置信度",
+    "type": 1
+  },
+  {
+    "field_name": "失败原因",
+    "type": 1
+  }
+]

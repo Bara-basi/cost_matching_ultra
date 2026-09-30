@@ -45,6 +45,25 @@ def get_config(key: str, default: str | None = None) -> str:
     raise KeyError(f"缺少配置项: {key}")
 
 
+def workbench_table(required: bool = True) -> tuple[str, str]:
+    """工作台读写目标表：(app_token, table_id)。
+
+    2026-09 起改用**「迈拓财务部门数据 副本 / 2026年报关数据」**：
+    来源表（`2026海关数据AI副本 / 2026年报关记录 AI`）里存在大量人工/脚本回填的脏数据，
+    无法作为干净的核算输入。财务部门数据副本的数据更准确，且 `采购金额` 是可写的数字字段。
+
+    配置键：`MT_FINANCE_DATA_TABLE_COPY_APP_TOKEN` / `MT_FINANCE_DATA_COPY_TABLE_ID`
+    （原表 `MT_FINANCE_DATA_TABLE_APP_TOKEN` / `MT_FINANCE_DATA_TABLE_ID` 仅作兜底）。
+    """
+    app = get_config("MT_FINANCE_DATA_TABLE_COPY_APP_TOKEN", "") \
+        or get_config("MT_FINANCE_DATA_TABLE_APP_TOKEN", "")
+    table = get_config("MT_FINANCE_DATA_COPY_TABLE_ID", "") \
+        or get_config("MT_FINANCE_DATA_TABLE_ID", "")
+    if required and (not app or not table):
+        raise ValueError("飞书目标表未配置（MT_FINANCE_DATA_TABLE_COPY_APP_TOKEN / MT_FINANCE_DATA_COPY_TABLE_ID）")
+    return app, table
+
+
 class FeishuError(RuntimeError):
     """飞书接口返回非 0 code 时抛出。"""
 
@@ -109,7 +128,7 @@ class FeishuClient:
             return self._token
         payload = self._request(
             "POST",
-            "/auth/v3/app_access_token/internal",
+            "/auth/v3/tenant_access_token/internal",
             body={"app_id": self.app_id, "app_secret": self.app_secret},
             auth=False,
         )
@@ -169,3 +188,88 @@ class FeishuClient:
 
     def list_records(self, app_token: str, table_id: str, **kwargs: Any) -> list[dict[str, Any]]:
         return list(self.iter_records(app_token, table_id, **kwargs))
+
+    def search_records(
+        self, app_token: str, table_id: str, filter: dict[str, Any], *,
+        page_size: int = 500,
+    ) -> list[dict[str, Any]]:
+        """飞书端检索，避免为局部筛选读取整张多维表。"""
+        return list(self.iter_search_records(app_token, table_id, filter, page_size=page_size))
+
+    def iter_search_records(
+        self, app_token: str, table_id: str, filter: dict[str, Any], *,
+        page_size: int = 100,
+    ):
+        """分页返回筛选结果；调用方达到单批上限后可立即停止请求。"""
+        page_token: str | None = None
+        while True:
+            data = self._request(
+                "POST", f"/bitable/v1/apps/{app_token}/tables/{table_id}/records/search",
+                params={"page_size": page_size, "page_token": page_token},
+                body={"filter": filter},
+            )["data"]
+            yield from data.get("items", [])
+            if not data.get("has_more"):
+                return
+            page_token = data.get("page_token")
+
+    # ---------- 写回（一键同步用） ----------
+
+    def update_record(
+        self, app_token: str, table_id: str, record_id: str, fields: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self._request(
+            "PUT",
+            f"/bitable/v1/apps/{app_token}/tables/{table_id}/records/{record_id}",
+            body={"fields": fields},
+        )["data"]
+
+    def create_record(
+        self, app_token: str, table_id: str, fields: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/bitable/v1/apps/{app_token}/tables/{table_id}/records",
+            body={"fields": fields},
+        )["data"]
+
+    def batch_create_records(
+        self, app_token: str, table_id: str, rows: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """批量新增，单次最多 500 条。"""
+        created: list[dict[str, Any]] = []
+        for start in range(0, len(rows), 500):
+            chunk = rows[start : start + 500]
+            if not chunk:
+                continue
+            data = self._request(
+                "POST",
+                f"/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_create",
+                body={"records": [{"fields": item} for item in chunk]},
+            )["data"]
+            created.extend(data.get("records", []))
+        return {"records": created}
+
+    def download_attachment(self, attachment: dict[str, Any]) -> bytes:
+        """下载目标多维表附件；只接受飞书官方媒体下载地址。"""
+        raw_url = str(attachment.get("url") or "")
+        parsed = urllib.parse.urlparse(raw_url)
+        token = str(attachment.get("file_token") or "")
+        expected = f"/open-apis/drive/v1/medias/{token}/download"
+        if not token or parsed.scheme != "https" or parsed.netloc != "open.feishu.cn" or parsed.path != expected:
+            raise ValueError("附件缺少有效的飞书媒体下载地址")
+        request = urllib.request.Request(raw_url, headers={
+            "Authorization": f"Bearer {self.tenant_access_token()}"})
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            data = response.read(25 * 1024 * 1024 + 1)
+        if len(data) > 25 * 1024 * 1024:
+            raise ValueError("报关单 PDF 超过 25MB")
+        if not data.startswith(b"%PDF"):
+            raise ValueError("附件不是可识别的 PDF")
+        return data
+
+    def create_field(self, app_token: str, table_id: str, name: str, field_type: int) -> dict[str, Any]:
+        return self._request(
+            "POST", f"/bitable/v1/apps/{app_token}/tables/{table_id}/fields",
+            body={"field_name": name, "type": field_type},
+        )["data"]

@@ -11,3 +11,9 @@ outputs/
 !outputs/customs_parse/
 outputs/
 .cache
+
+.runtime/
+outputs/runs/
+web/node_modules/
+web/dist/
+.pnpm-store/
