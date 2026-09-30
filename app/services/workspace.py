@@ -110,7 +110,9 @@ def result_rows(job_id: str) -> list[dict] | None:
             flags = json.loads(flags_path.read_text(encoding="utf-8"))
             for index, values in flags.items():
                 if 0 <= int(index) < len(rows):
-                    rows[int(index)] = {**rows[int(index)], **values}
+                    rows[int(index)] = {**rows[int(index)], **{
+                        key: values[key] for key in ("异常类型", "异常明细", "_人工上报")
+                        if key in values}}
         reviewed_path = JOBS_DIR / job_id / "reviewed.json"
         if reviewed_path.exists():
             reviewed = json.loads(reviewed_path.read_text(encoding="utf-8"))
@@ -463,12 +465,21 @@ def override_row(job_id: str, index: int, amount: str, operator: str, reason: st
     value = Decimal(str(amount))
     if value < 0 or value.as_tuple().exponent < -2:
         raise ValueError("采购金额必须为非负数，最多两位小数")
+    flags_path = JOBS_DIR / job_id / "flags.json"
+    flags = json.loads(flags_path.read_text(encoding="utf-8")) if flags_path.exists() else {}
+    if flags.get(str(index), {}).get("state") == "resubmitted":
+        raise ValueError("这条记录已重新提交，请在新任务中调整金额")
     path = JOBS_DIR / job_id / "overrides.json"
     edits = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     old = rows[index].get("采购金额", "")
     edits[str(index)] = {"采购金额": f"{value:.2f}", "异常类型": "人工调整待写回",
                          "异常明细": "人工调整采购金额；需在写回预览中确认。", "_人工调整": True}
     path.write_text(json.dumps(edits, ensure_ascii=False, indent=2), encoding="utf-8")
+    if str(index) in flags:
+        prior_flag = flags.pop(str(index))
+        flags_path.write_text(json.dumps(flags, ensure_ascii=False, indent=2), encoding="utf-8")
+        append_audit(job_id, "resolve_flag_by_override", operator,
+                     {"row": index, "reportedReason": prior_flag.get("异常明细", "")})
     append_audit(job_id, "override", operator, {"row": index, "old": old, "new": str(value), "reason": reason})
     current = result_rows(job_id) or []
     columns = FRIENDLY_COLUMNS + SOURCE_COLUMNS
@@ -481,6 +492,14 @@ def override_row(job_id: str, index: int, amount: str, operator: str, reason: st
 
 
 def flag_exception(job_id: str, index: int, operator: str, reason: str) -> dict:
+    # 与飞书写回共用互斥锁，防止预览通过后、真正落表前插入人工异常。
+    from app.services import feishu_workflow
+    with feishu_workflow._PUSH_LOCK:
+        return _flag_exception_locked(job_id, index, operator, reason)
+
+
+def _flag_exception_locked(job_id: str, index: int, operator: str, reason: str) -> dict:
+    from app.services import feishu_workflow
     status = get_job(job_id)
     if not status or status.get("kind") != "sync" or status.get("state") != "complete":
         raise ValueError("只能上报已完成的飞书区间核算记录")
@@ -491,7 +510,6 @@ def flag_exception(job_id: str, index: int, operator: str, reason: str) -> dict:
         raise ValueError("结果记录不存在")
     if rows[index].get("异常类型") != "正常":
         raise ValueError("这条记录已是异常，请直接复核")
-    from app.services import feishu_workflow
     proposal = feishu_workflow.plan(job_id)
     group = next((item for item in (proposal or {}).get("groups", [])
                   if any(child["index"] == index for child in item["children"])), None)
@@ -504,7 +522,9 @@ def flag_exception(job_id: str, index: int, operator: str, reason: str) -> dict:
     path = JOBS_DIR / job_id / "flags.json"
     flags = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     flags[str(index)] = {"异常类型": "人工上报异常", "异常明细": reason.strip(),
-                         "_人工上报": True}
+                         "_人工上报": True, "state": "active",
+                         "reportedAt": datetime.now(timezone.utc).isoformat(),
+                         "operator": operator.strip()}
     path.write_text(json.dumps(flags, ensure_ascii=False, indent=2), encoding="utf-8")
     append_audit(job_id, "flag_exception", operator, {"row": index, "reason": reason.strip()})
     current = result_rows(job_id) or []
@@ -522,17 +542,55 @@ def all_exceptions() -> list[dict]:
     found = []
     statuses = [item for directory in JOBS_DIR.iterdir() if directory.is_dir()
                 if (item := get_job(directory.name)) and item.get("state") == "complete"]
-    for status in sorted(statuses, key=lambda item: item.get("createdAt", ""), reverse=True):
-        if not status.get("summary", {}).get("exceptionRows"):
+    for status in statuses:
+        path = JOBS_DIR / status["id"] / "flags.json"
+        if not path.exists():
             continue
-        for index, row in enumerate(result_rows(status["id"]) or []):
-            if row.get("异常类型") != "正常":
-                found.append({"jobId": status["id"], "createdAt": status.get("createdAt"),
-                              "kind": status.get("kind"), "index": index,
-                              "declaration": row.get("报关单号"), "contract": row.get("合同号_1"),
-                              "product": row.get("报关品名"), "type": row.get("异常类型"),
-                              "reason": row.get("异常明细")})
-    return found
+        flags = json.loads(path.read_text(encoding="utf-8"))
+        base_path = JOBS_DIR / status["id"] / "rows.json"
+        base_rows = json.loads(base_path.read_text(encoding="utf-8")) if base_path.exists() else []
+        for index_text, flag in flags.items():
+            index = int(index_text)
+            if not 0 <= index < len(base_rows) or not flag.get("_人工上报"):
+                continue
+            row = base_rows[index]
+            found.append({"jobId": status["id"], "createdAt": status.get("createdAt"),
+                          "index": index, "declaration": row.get("报关单号"),
+                          "contract": row.get("合同号_1"), "product": row.get("报关品名"),
+                          "reason": flag.get("异常明细"), "operator": flag.get("operator"),
+                          "reportedAt": flag.get("reportedAt"),
+                          "state": flag.get("state", "active"), "newJobId": flag.get("newJobId")})
+    return sorted(found, key=lambda item: item.get("reportedAt") or item.get("createdAt") or "", reverse=True)
+
+
+def resubmit_exception(job_id: str, index: int, operator: str) -> dict:
+    if not operator.strip():
+        raise ValueError("请填写操作员称呼")
+    status = get_job(job_id)
+    flags_path = JOBS_DIR / job_id / "flags.json"
+    if not status or status.get("kind") != "sync" or not flags_path.exists():
+        raise ValueError("待重新核验的记录不存在")
+    flags = json.loads(flags_path.read_text(encoding="utf-8"))
+    flag = flags.get(str(index))
+    if not flag or flag.get("state", "active") != "active":
+        raise ValueError("这条记录已重新提交或已人工调整")
+    input_path = JOBS_DIR / job_id / "input_rows.json"
+    source_path = JOBS_DIR / job_id / "source_records.json"
+    if not input_path.exists() or not source_path.exists():
+        raise ValueError("原任务缺少输入数据，无法重新核验")
+    inputs = json.loads(input_path.read_text(encoding="utf-8"))
+    sources = json.loads(source_path.read_text(encoding="utf-8"))
+    if not inputs or not sources:
+        raise ValueError("原任务输入为空，无法重新核验")
+    new_id = start_job(kind="sync", declarations=inputs, source_records=sources)
+    _update(new_id, selectionFilters=status.get("selectionFilters", {}),
+            resubmittedFrom={"jobId": job_id, "index": index})
+    flag.update(state="resubmitted", newJobId=new_id,
+                resubmittedAt=datetime.now(timezone.utc).isoformat(), resubmittedBy=operator.strip())
+    flags_path.write_text(json.dumps(flags, ensure_ascii=False, indent=2), encoding="utf-8")
+    append_audit(job_id, "resubmit_exception", operator,
+                 {"row": index, "newJobId": new_id, "reason": flag.get("异常明细", "")})
+    return {"id": new_id}
 
 
 def mark_reviewed(job_id: str, index: int, operator: str) -> dict:

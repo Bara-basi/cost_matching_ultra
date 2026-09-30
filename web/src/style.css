@@ -39,3 +39,9 @@
 .progress-track span{transition:width .09s linear}
 :root[data-motion=off] .result-row.flagged{animation:none;background:var(--red-pale)}
 .list-more{display:flex;justify-content:center;padding:20px;border-top:1px solid var(--line)}
+.exception-entry{display:flex;align-items:center;border-bottom:1px solid var(--line)}
+.exception-entry:last-child{border-bottom:0}
+.exception-entry .task-row{flex:1;min-width:0;border-bottom:0}
+.exception-action{flex:0 0 auto;margin-right:20px;white-space:nowrap}
+@media(max-width:590px){.exception-entry{align-items:stretch;flex-direction:column}.exception-action{margin:0 18px 14px}}
+.button-chevron{display:block;width:12px;height:12px;flex:none}

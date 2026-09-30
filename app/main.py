@@ -45,6 +45,11 @@ class FlagExceptionRequest(BaseModel):
     reason: str
 
 
+class ResubmitExceptionRequest(BaseModel):
+    index: int
+    operator: str
+
+
 class SourceMappingRequest(BaseModel):
     row_index: int
     source_id: str
@@ -284,6 +289,14 @@ def exception_records() -> dict:
 def job_flag_exception(job_id: str, request: FlagExceptionRequest) -> dict:
     try:
         return workspace.flag_exception(job_id, request.index, request.operator, request.reason)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/jobs/{job_id}/resubmit-exception")
+def job_resubmit_exception(job_id: str, request: ResubmitExceptionRequest) -> dict:
+    try:
+        return workspace.resubmit_exception(job_id, request.index, request.operator)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
