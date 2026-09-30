@@ -44,4 +44,12 @@
 .exception-entry .task-row{flex:1;min-width:0;border-bottom:0}
 .exception-action{flex:0 0 auto;margin-right:20px;white-space:nowrap}
 @media(max-width:590px){.exception-entry{align-items:stretch;flex-direction:column}.exception-action{margin:0 18px 14px}}
-.button-chevron{display:block;width:12px;height:12px;flex:none}
+.text-button,.quick-card b,.stat-link small,.source-links a,.source-links button,.downloads a{display:inline-flex;align-items:center;gap:6px}
+.stat-link small,.quick-card b{display:flex}
+.source-links a,.source-links button{width:fit-content}
+.result-item{display:flex;align-items:center;border-bottom:1px solid var(--line)}
+.result-item:last-child{border-bottom:0}
+.result-item .result-row{flex:1;min-width:0;width:auto;border-bottom:0}
+.flag-inline{flex:none;margin:0 13px 0 4px;padding:8px 10px;border:1px solid color-mix(in srgb,var(--red) 35%,transparent);border-radius:8px;background:var(--red-pale);color:var(--red);font-size:10px;font-weight:700;white-space:nowrap;transition:transform .18s,background .18s}
+.flag-inline:hover{transform:scale(1.05);background:color-mix(in srgb,var(--red-pale) 80%,var(--red))}
+@media(max-width:590px){.flag-inline{margin-right:7px;padding:6px;font-size:9px}}
