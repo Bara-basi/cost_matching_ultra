@@ -42,6 +42,23 @@ def num(value) -> float:
         return 0.0
 
 
+def list_is_stale(cached: dict, max_age_days: float) -> bool:
+    """附件清单缓存是否过期（判断依据：抓取时间；判不出时间就当过期）。"""
+    from datetime import datetime, timezone
+
+    stamp = str(cached.get("fetchedAt") or "").strip()
+    if not stamp:
+        return True
+    try:
+        when = datetime.fromisoformat(stamp)
+    except ValueError:
+        return True
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    age_days = (datetime.now(timezone.utc) - when.astimezone(timezone.utc)).total_seconds() / 86400
+    return age_days >= max_age_days
+
+
 def candidates() -> list[dict]:
     """发生过入库（有入库数量或入库日期）的采购单，按入库时间倒序。"""
     rows = read_jsonl(CACHE_ROOT / "purchases" / "purchases.jsonl")
@@ -53,8 +70,15 @@ def candidates() -> list[dict]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--token", default="")
+    parser.add_argument("--code", default="", help="只跑指定的采购单号（可多个，用逗号分隔）")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--list-max-age-days",
+        type=float,
+        default=3.0,
+        help="附件清单缓存超过这么多天就重抓（睿贝 tempFile 下载链接会过期，0=永不复用旧清单）",
+    )
     parser.add_argument("--pause", type=float, default=0.25)
     args = parser.parse_args()
 
@@ -62,6 +86,14 @@ def main() -> None:
 
     token = args.token or get_config("ERP_API_KEY")
     todo = candidates()
+    if args.code:
+        wanted = {part.strip() for part in args.code.split(",") if part.strip()}
+        rows = read_jsonl(CACHE_ROOT / "purchases" / "purchases.jsonl")
+        from_code = [r for r in rows if str(r.get("purchase_code") or "").strip() in wanted]
+        known = {str(r.get("purchase_code") or "").strip() for r in from_code}
+        # 单号不在采购单缓存里也照样抓一次（清单接口以单号为准）
+        missing = [{"purchase_code": code} for code in sorted(wanted - known)]
+        todo = from_code + missing
     if args.limit:
         todo = todo[: args.limit]
     print(f"发生过入库的采购单 {len(todo)} 个", flush=True)
@@ -80,6 +112,10 @@ def main() -> None:
             if not code:
                 continue
             cached = None if args.force else load_list(code)
+            if cached is not None and args.list_max_age_days > 0 and list_is_stale(cached, args.list_max_age_days):
+                # 清单里的 downloadUrl 指向 tempFile，过期后服务端返回 200 + 空体
+                # （下到 0 字节文件，成本匹配就永远「缺入库单」）→ 过期清单必须重抓。
+                cached = None
             if cached is None:
                 try:
                     text = client.call_text(
@@ -113,7 +149,7 @@ def main() -> None:
             for item in grn_items:
                 name = item["name"]
                 target = GRN_DIR / safe_name(code) / safe_name(name, "grn.xlsx")
-                if target.exists() and not args.force:
+                if target.exists() and target.stat().st_size > 0 and not args.force:
                     stats["skipped"] += 1
                     continue
                 try:
@@ -121,6 +157,14 @@ def main() -> None:
                 except Exception as exc:  # noqa: BLE001
                     stats["errors"] += 1
                     entry["files"].append({"name": name, "status": "error", "error": str(exc)[:120]})
+                    continue
+                if not size:
+                    # 200 + 空体：下载链接已过期或会话失效，不能算成功
+                    target.unlink(missing_ok=True)
+                    stats["errors"] += 1
+                    entry["files"].append(
+                        {"name": name, "status": "empty", "error": "空文件（下载链接可能已过期）"}
+                    )
                     continue
                 stats["downloaded"] += 1
                 entry["files"].append(

@@ -233,7 +233,7 @@ def main() -> None:
         if args.with_grn_parse and not args.lists_only:
             print("[4/5] 解析新入库单", flush=True)
             write_state(phase="入库单解析", message="正在解析新入库单")
-            attachment_stats["parse"] = run_script(["scripts\\parse_grn.py"])
+            attachment_stats["parse"] = run_script([str(PROJECT_ROOT / "scripts" / "parse_grn.py")])
 
         print("[5/5] 重建出运产品行索引", flush=True)
         write_state(phase="索引", message="正在重建出运产品行索引")
@@ -274,7 +274,7 @@ def run_script(args: list[str]) -> dict:
 
 
 def run_attachments(limit: int) -> dict:
-    args = ["scripts\\erp_fetch_grn_mcp.py"]
+    args = [str(PROJECT_ROOT / "scripts" / "erp_fetch_grn_mcp.py")]
     if limit:
         args += ["--limit", str(limit)]
     return run_script(args)
