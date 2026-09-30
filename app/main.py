@@ -39,6 +39,12 @@ class ReviewRequest(BaseModel):
     operator: str
 
 
+class FlagExceptionRequest(BaseModel):
+    index: int
+    operator: str
+    reason: str
+
+
 class SourceMappingRequest(BaseModel):
     row_index: int
     source_id: str
@@ -267,6 +273,19 @@ def job_rows(job_id: str) -> dict:
     if rows is None:
         raise HTTPException(status_code=404, detail="结果尚未生成")
     return {"rows": rows}
+
+
+@app.get("/api/exceptions")
+def exception_records() -> dict:
+    return {"rows": workspace.all_exceptions()}
+
+
+@app.post("/api/jobs/{job_id}/flag-exception")
+def job_flag_exception(job_id: str, request: FlagExceptionRequest) -> dict:
+    try:
+        return workspace.flag_exception(job_id, request.index, request.operator, request.reason)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/jobs/{job_id}/override")

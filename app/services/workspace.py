@@ -105,6 +105,12 @@ def result_rows(job_id: str) -> list[dict] | None:
             for index, values in edits.items():
                 if 0 <= int(index) < len(rows):
                     rows[int(index)] = {**rows[int(index)], **values}
+        flags_path = JOBS_DIR / job_id / "flags.json"
+        if flags_path.exists():
+            flags = json.loads(flags_path.read_text(encoding="utf-8"))
+            for index, values in flags.items():
+                if 0 <= int(index) < len(rows):
+                    rows[int(index)] = {**rows[int(index)], **values}
         reviewed_path = JOBS_DIR / job_id / "reviewed.json"
         if reviewed_path.exists():
             reviewed = json.loads(reviewed_path.read_text(encoding="utf-8"))
@@ -226,10 +232,16 @@ def start_job(
         (job_dir / "input_rows.json").write_text(
             json.dumps(declarations, ensure_ascii=False, default=str), encoding="utf-8"
         )
+    declaration_numbers = list(dict.fromkeys(str(item.get("报关单号") or "").strip()
+                                             for item in declarations or [] if item.get("报关单号")))
+    first_contract = next((str(item.get("合同号_1") or "").strip() for item in declarations or []
+                           if item.get("合同号_1")), "")
     _update(
         job_id, id=job_id, kind=kind, state="queued", progress=2, message="已接收输入",
         createdAt=datetime.now(timezone.utc).isoformat(),
         fileCount=len(saved), rowCount=len(declarations or []), useAi=use_ai,
+        subject=declaration_numbers[0] if declaration_numbers else first_contract,
+        declarationCount=len(declaration_numbers),
         downloads={"results": f"/api/jobs/{job_id}/download/results",
                    "exceptions": f"/api/jobs/{job_id}/download/exceptions"},
     )
@@ -398,7 +410,11 @@ def list_jobs(limit: int = 30) -> list[dict]:
     for item in selected:
         if item.get("kind") == "sync" and item.get("state") == "complete":
             proposal = feishu_workflow.plan(item["id"])
-            item["writebackReady"] = proposal["summary"]["ready"] if proposal else 0
+            push_path = JOBS_DIR / item["id"] / "push_results.json"
+            pushed = json.loads(push_path.read_text(encoding="utf-8")) if push_path.exists() else []
+            written = {entry.get("sourceId") for entry in pushed if entry.get("status") == "written"}
+            item["writebackReady"] = sum(group["status"] == "ready" and group["sourceId"] not in written
+                                          for group in (proposal or {}).get("groups", []))
     return selected
 
 
@@ -462,6 +478,61 @@ def override_row(job_id: str, index: int, amount: str, operator: str, reason: st
     from app.services.review import summary as review_summary
     _update(job_id, summary=review_summary(current))
     return edits[str(index)]
+
+
+def flag_exception(job_id: str, index: int, operator: str, reason: str) -> dict:
+    status = get_job(job_id)
+    if not status or status.get("kind") != "sync" or status.get("state") != "complete":
+        raise ValueError("只能上报已完成的飞书区间核算记录")
+    if not operator.strip() or not reason.strip():
+        raise ValueError("请填写操作员称呼和异常原因")
+    rows = result_rows(job_id)
+    if rows is None or not 0 <= index < len(rows):
+        raise ValueError("结果记录不存在")
+    if rows[index].get("异常类型") != "正常":
+        raise ValueError("这条记录已是异常，请直接复核")
+    from app.services import feishu_workflow
+    proposal = feishu_workflow.plan(job_id)
+    group = next((item for item in (proposal or {}).get("groups", [])
+                  if any(child["index"] == index for child in item["children"])), None)
+    pushed_path = JOBS_DIR / job_id / "push_results.json"
+    if group and pushed_path.exists():
+        pushed = json.loads(pushed_path.read_text(encoding="utf-8"))
+        if any(item.get("sourceId") == group["sourceId"] and item.get("status") == "written"
+               for item in pushed):
+            raise ValueError("这组记录已经写回，请先在飞书核对，不可再标记为待写回异常")
+    path = JOBS_DIR / job_id / "flags.json"
+    flags = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    flags[str(index)] = {"异常类型": "人工上报异常", "异常明细": reason.strip(),
+                         "_人工上报": True}
+    path.write_text(json.dumps(flags, ensure_ascii=False, indent=2), encoding="utf-8")
+    append_audit(job_id, "flag_exception", operator, {"row": index, "reason": reason.strip()})
+    current = result_rows(job_id) or []
+    _write_xlsx(current, JOBS_DIR / job_id / "成本匹配结果.xlsx", FRIENDLY_COLUMNS + SOURCE_COLUMNS)
+    _write_xlsx([item for item in current if item.get("异常类型") != "正常"],
+                JOBS_DIR / job_id / "异常记录.xlsx", FRIENDLY_COLUMNS + SOURCE_COLUMNS)
+    from app.services.review import summary as review_summary
+    _update(job_id, summary=review_summary(current))
+    return flags[str(index)]
+
+
+def all_exceptions() -> list[dict]:
+    if not JOBS_DIR.exists():
+        return []
+    found = []
+    statuses = [item for directory in JOBS_DIR.iterdir() if directory.is_dir()
+                if (item := get_job(directory.name)) and item.get("state") == "complete"]
+    for status in sorted(statuses, key=lambda item: item.get("createdAt", ""), reverse=True):
+        if not status.get("summary", {}).get("exceptionRows"):
+            continue
+        for index, row in enumerate(result_rows(status["id"]) or []):
+            if row.get("异常类型") != "正常":
+                found.append({"jobId": status["id"], "createdAt": status.get("createdAt"),
+                              "kind": status.get("kind"), "index": index,
+                              "declaration": row.get("报关单号"), "contract": row.get("合同号_1"),
+                              "product": row.get("报关品名"), "type": row.get("异常类型"),
+                              "reason": row.get("异常明细")})
+    return found
 
 
 def mark_reviewed(job_id: str, index: int, operator: str) -> dict:

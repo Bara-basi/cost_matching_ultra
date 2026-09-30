@@ -16,6 +16,42 @@ from app.services import contract_shipments, feishu_workflow, lookup, review, sh
 
 
 class WorkbenchTests(unittest.TestCase):
+    def test_manual_adjustment_stays_writable_and_flag_blocks_group(self):
+        source = {"record_id": "rec_1", "报关单号": "223120260000174064",
+                  "合同号_1": "26MT-01A001", "报关品名": "钢管", "报关金额": "100.00"}
+        row = {"报关单号": source["报关单号"], "合同号_1": source["合同号_1"],
+               "报关品名": "钢管", "供应商简称": "甲", "报关金额": "100.00",
+               "采购金额": "80.00", "异常类型": "正常", "异常明细": ""}
+        with tempfile.TemporaryDirectory() as directory, patch.object(workspace, "JOBS_DIR", Path(directory)):
+            root = Path(directory) / "sample"
+            root.mkdir()
+            (root / "rows.json").write_text(json.dumps([row], ensure_ascii=False), encoding="utf-8")
+            (root / "source_records.json").write_text(json.dumps([source], ensure_ascii=False), encoding="utf-8")
+            workspace._update("sample", kind="sync", state="complete", createdAt="2026-09-30T00:00:00+00:00")
+            self.assertEqual(feishu_workflow.plan("sample")["summary"]["ready"], 1)
+            response = TestClient(app).post("/api/jobs/sample/override", json={
+                "index": 0, "amount": "82.00", "operator": "财务甲", "reason": "凭证复核"})
+            self.assertEqual(response.status_code, 200)
+            proposal = feishu_workflow.plan("sample")
+            self.assertEqual(proposal["summary"]["ready"], 1)
+            self.assertTrue(proposal["groups"][0]["manualAdjusted"])
+            # 上报异常仅允许正常记录；独立任务验证阻断与异常汇总。
+            (root / "overrides.json").unlink()
+            response = TestClient(app).post("/api/jobs/sample/flag-exception", json={
+                "index": 0, "operator": "财务乙", "reason": "供应商凭证金额待核实"})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(feishu_workflow.plan("sample")["summary"]["ready"], 0)
+            self.assertEqual(workspace.all_exceptions()[0]["reason"], "供应商凭证金额待核实")
+            self.assertEqual(workspace.get_job("sample")["summary"]["exceptionRows"], 1)
+            self.assertEqual(TestClient(app).post("/api/jobs/sample/flag-exception", json={
+                "index": 0, "operator": "财务乙", "reason": "重复"}).status_code, 400)
+            (root / "flags.json").unlink()
+            (root / "push_results.json").write_text(json.dumps([
+                {"sourceId": "rec_1", "status": "written"}]), encoding="utf-8")
+            self.assertEqual(TestClient(app).post("/api/jobs/sample/flag-exception", json={
+                "index": 0, "operator": "财务乙", "reason": "写回后上报"}).status_code, 400)
+            self.assertEqual(workspace.list_jobs()[0]["writebackReady"], 0)
+
     def test_sync_selects_uncosted_rows_without_pdf_and_completes_contract_context(self):
         def record(key, declaration, contract, amount, *, cost="", pdf=False, day=1780272000000):
             return {"record_id": key, "fields": {"报关单号": declaration, "合同号_1": contract,

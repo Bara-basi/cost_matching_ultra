@@ -29,3 +29,13 @@
 .result-layout>.detail-panel{animation:sideSlide .34s cubic-bezier(.2,.8,.2,1) both}
 :root[data-motion=off] .page-enter,:root[data-motion=off] .page-enter>.panel,:root[data-motion=off] .page-enter>.hero,:root[data-motion=off] .page-enter>.stats,:root[data-motion=off] .page-enter>.quick-grid,:root[data-motion=off] .detail-panel,:root[data-motion=off] .modal-card{animation:none}
 :root[data-motion=off] .btn,:root[data-motion=off] .import-label{transition:none}
+.stat-link{text-align:left;color:var(--ink);cursor:pointer;transition:transform .2s,box-shadow .2s,border-color .2s}
+.stat-link:hover,.stat-link:focus-visible{transform:translateY(-4px);border-color:var(--brand);box-shadow:0 14px 35px rgba(23,107,115,.15)}
+.stat-link:focus-visible{outline:2px solid var(--brand);outline-offset:3px}
+.flag-button{background:var(--red-pale);color:var(--red);border:1px solid color-mix(in srgb,var(--red) 25%,transparent)}
+.flag-button:hover{background:color-mix(in srgb,var(--red-pale) 75%,var(--red));transform:translateY(-2px)}
+.result-row.flagged{animation:flagPulse 1.2s cubic-bezier(.2,.8,.2,1) both;position:relative;z-index:5}
+@keyframes flagPulse{0%{transform:scale(1);background:var(--paper)}28%{transform:scale(1.065);background:var(--red-pale);box-shadow:0 18px 38px rgba(174,65,69,.26)}65%{transform:scale(1.035);background:color-mix(in srgb,var(--red-pale) 78%,var(--paper))}100%{transform:scale(1);background:var(--paper);box-shadow:none}}
+.progress-track span{transition:width .09s linear}
+:root[data-motion=off] .result-row.flagged{animation:none;background:var(--red-pale)}
+.list-more{display:flex;justify-content:center;padding:20px;border-top:1px solid var(--line)}

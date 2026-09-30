@@ -269,7 +269,8 @@ def start_scan(**filters):
     declarations = [{"来源文件": "飞书副本商品行", **source, "总价": source["报关金额"]}
                     for source in sources]
     job_id = workspace.start_job(kind="sync", declarations=declarations, source_records=sources)
-    workspace._update(job_id, skipped=chosen["skipped"])
+    workspace._update(job_id, skipped=chosen["skipped"], selectionFilters={
+        key: value for key, value in filters.items() if value not in (None, "")})
     return {"id": job_id, "selection": chosen["selection"], "skipped": chosen["skipped"]}
 
 
@@ -369,6 +370,7 @@ def plan(job_id):
                        "pdfTokens": source.get("pdfTokens", []),
                        "originalAmount": str(original) if original is not None else "",
                        "resultAmount": f"{total:.2f}", "status": "ready" if not reasons else "blocked",
+                       "manualAdjusted": any(child.get("_人工调整") for child in children),
                        "reasons": reasons, "children": numbered})
     return {"summary": {"ready": sum(g["status"] == "ready" for g in output),
                          "blocked": sum(g["status"] != "ready" for g in output),
