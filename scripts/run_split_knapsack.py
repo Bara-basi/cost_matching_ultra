@@ -1442,8 +1442,17 @@ def run(
                 residual_result, residual_exact = solve_residual(
                     decls, residual_items, tolerance
                 )
-                if residual_result.assignments and not any(
-                    "多解" in note for note in residual_result.notes
+                # 「差额当客户费用」只在**确实存在客户费用**（睿贝出运单有 expenseList）时
+                # 才允许；否则残差只能是可忽略的零头，绝不能凭空造一笔费用（2026-09-30 用户口径）。
+                residual_max = 0
+                for _decl, _rows in decls.items():
+                    _cap = sum(to_cents(r.get("amount")) for r in _rows)
+                    _assigned = sum(line.amount for line in residual_result.assignments.get(_decl, []))
+                    residual_max = max(residual_max, abs(_cap - _assigned))
+                if (
+                    residual_result.assignments
+                    and not any("多解" in note for note in residual_result.notes)
+                    and (fees or residual_max <= IGNORABLE_DIFF_CENTS)
                 ):
                     info_res = {
                         "result": residual_result,

@@ -117,11 +117,15 @@ def start(*, refresh_days: float = 7.0, lists_only: bool = False,
         if not with_attachments:
             args.append("--no-attachments")
         log = LOG_PATH.open("a", encoding="utf-8")
+        # 子进程的 stdout 若按 Windows 本地代码页（GBK）编码，遇到字符就会崩；
+        # 统一强制 UTF-8，避免同步明明跑完却被最后一行输出打成 failed。
+        child_env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
         _PROC = subprocess.Popen(
             args,
             cwd=str(PROJECT_ROOT),
             stdout=log,
             stderr=subprocess.STDOUT,
+            env=child_env,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     return {"state": "running", "message": "已开始同步睿贝数据"}

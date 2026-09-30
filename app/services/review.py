@@ -210,6 +210,23 @@ def _batch_purchase_totals(contracts: set[str]) -> dict[str, Decimal]:
     return dict(totals)
 
 
+def _shipment_fee_total(contract: str) -> Decimal | None:
+    """出运单的客户费用合计；取不到出运明细时返回 None（不敢下结论）。"""
+    from app.services.shipment_detail import load_shipment_detail
+
+    for key in (contract, strip_pi(contract), f"PI-{strip_pi(contract)}"):
+        if not key:
+            continue
+        payload = load_shipment_detail(key)
+        if not payload:
+            continue
+        total = Decimal(0)
+        for item in payload.get("expenseList") or []:
+            total += dec(item.get("金额"))
+        return total
+    return None
+
+
 _ERP_INDEX: dict | None = None
 
 
@@ -305,6 +322,20 @@ def build_rows(split_xlsx: Path, amount_source: dict[str, str] | None = None) ->
             issues.append(("睿贝未定价", "睿贝出运单这一行没有采购金额，需要先补价。"))
         if total <= 0:
             issues.append(("缺入库单", "该采购单还没有可用的入库单，采购金额暂时算不出来。"))
+        # 客户费用口径（2026-09-30 用户口径：没有明确找到额外费用就不能谎报费用）：
+        # 「客户费用分摊」只有在睿贝出运单**确实登记了客户费用**时才算数；出运单没有任何费用
+        # 却摊出了费用，说明是拿差额硬凑金额——必须报异常，绝不能当正常金额写回。
+        fee_share = dec(row.get("客户费用分摊"))
+        if abs(fee_share) > Decimal("1"):
+            fee_total = _shipment_fee_total(str(row.get("合同号_1") or ""))
+            if fee_total is not None and fee_total == 0:
+                issues.append(
+                    (
+                        "金额对不上",
+                        f"报关金额比睿贝出运金额多 {abs(fee_share):.2f}，但睿贝出运单里没有任何客户费用，"
+                        "差额来源不明，请核对这一单的报关金额。",
+                    )
+                )
         # 本批该覆盖多少：优先用「本批出运单上这张采购单的货值」；
         # 出运明细取不到时退回整单累计值（宁可少报，也不要把单批误判成缺报关单）
         expected = batch_totals.get(po, Decimal(0))

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -191,6 +192,14 @@ def sync_shipment_details(refresh_days: float, pause: float) -> dict:
 
 
 def main() -> None:
+    # 强制 UTF-8 输出：子进程 stdout 常被重定向到文件/管道，Windows 默认 GBK 遇到
+    # 代理字符（\ufffd）会直接抛 UnicodeEncodeError，把已完成的同步误标成 failed。
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--refresh-days", type=float, default=7.0,
                         help="出运明细缓存超过这么多天就重抓（0=只补缺）")
@@ -236,8 +245,11 @@ def main() -> None:
             message=f"同步完成（出运明细 +{detail_stats['done']}/缺 {detail_stats['requested']}）",
             details=detail_stats, attachments=attachment_stats, index=index_stats,
         )
-        print(json.dumps({"details": detail_stats, "attachments": attachment_stats, "index": index_stats},
-                         ensure_ascii=False))
+        try:  # 兜底：控制台/日志的编码问题绝不能把「已完成的同步」改写成失败
+            print(json.dumps({"details": detail_stats, "attachments": attachment_stats,
+                              "index": index_stats}, ensure_ascii=False))
+        except Exception:  # noqa: BLE001
+            pass
     except Exception as exc:  # noqa: BLE001
         write_state(state="failed", finishedAt=now_iso(), message=str(exc)[:200])
         raise
@@ -252,6 +264,7 @@ def run_script(args: list[str]) -> dict:
         text=True,
         encoding="utf-8",
         errors="replace",
+        env={**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"},
     )
     tail = (process.stdout or "").strip().splitlines()[-3:]
     if process.returncode:
