@@ -50,7 +50,20 @@ class SourceMappingRequest(BaseModel):
 LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
 
 
+def _trust_all() -> bool:
+    """`WORKBENCH_TRUST_ALL=1`：整站视为可信，不再要求网关口令。
+
+    给「直接在 IP:端口 上给内部同事用、没有域名也没有反向代理」的部署用：
+    任何能访问到该端口的人都能写回飞书、查看睿贝凭证，所以只在内部环境打开。
+    """
+    from app.services.feishu_client import get_config
+
+    return str(get_config("WORKBENCH_TRUST_ALL", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _is_local(request: Request) -> bool:
+    if _trust_all():
+        return True
     host = (request.client.host if request.client else "") or ""
     return host in LOCAL_HOSTS
 
@@ -100,6 +113,8 @@ def health(request: Request) -> dict:
         "writeEnabled": _is_local(request) or bool(get_config("WORKBENCH_WRITE_TOKEN", "")),
         "evidenceEnabled": _is_local(request) or bool(get_config("WORKBENCH_EVIDENCE_TOKEN", "")),
         "local": _is_local(request),
+        # 打开了整站信任开关（没有域名/网关的直连部署）：写回与凭证不再要口令
+        "trustAll": _trust_all(),
         "erpSync": erp_sync.status(),
     }
 
