@@ -135,6 +135,33 @@ cd "E:\财务\cost matching\cost_matching_ultra"
 启动后访问 <http://127.0.0.1:8765/> 打开界面，<http://127.0.0.1:8765/api/health> 查看服务状态。
 按 `Ctrl + C` 停止服务。
 
+### Linux 服务器（当前线上部署）
+
+```bash
+cd /opt/cost_matching_ultra
+
+# 首次：后端依赖 + 前端构建（改了 web/ 只需再跑最后两行）
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+cd web && npm install && npm run build && cd ..
+
+# 启动
+setsid nohup .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8765 \
+  >> tmp/workbench.log 2>&1 < /dev/null &
+
+# 重启（改了代码或 .env 都要重启）
+pkill -f "uvicorn app.main:app --host 0.0.0.0 --port 8765"; sleep 2
+setsid nohup .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8765 \
+  >> tmp/workbench.log 2>&1 < /dev/null &
+
+# 停止 / 看状态
+pkill -f "uvicorn app.main:app --host 0.0.0.0 --port 8765"
+curl -s http://127.0.0.1:8765/api/health
+```
+
+访问 `http://<服务器IP>:8765/`。改 `web/` 后必须重新 `npm run build`，改 `.env` 必须重启才生效。
+该部署没有域名和反向代理，靠 `.env` 的 `WORKBENCH_TRUST_ALL=1` 让内网直连即可写回；
+置 0 则恢复「本机免口令 + 远端需网关注入 token」的口径。
+
 > **定时全量同步**：服务启动时按需同步一次（数据还新就跳过），之后后台调度线程**每 12 小时**再跑一轮：
 > ① 刷新三类单据列表（按主键合并，只增不丢）→ ② 补抓缺失/过期的出运明细（MCP）
 > → ③ 补抓采购附件里的入库单（成本匹配的唯一凭证，已下载的跳过）→ ④ 重建出运产品行索引。

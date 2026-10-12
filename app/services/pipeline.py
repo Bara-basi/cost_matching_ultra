@@ -80,31 +80,107 @@ def _sum_text(*values) -> str:
     return text or "0"
 
 
+def _dec_text(value) -> "Decimal":
+    from decimal import Decimal, InvalidOperation
+
+    try:
+        return Decimal(str(value).replace(",", "").strip() or "0")
+    except (InvalidOperation, AttributeError):
+        return Decimal(0)
+
+
+def _fmt_number(value) -> str:
+    text = f"{value:.4f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def merge_group_totals(rows: list[dict]) -> tuple[str, str]:
+    """同 `报关单号 + 合同号 + 报关品名` 的多行合计 → (报关金额, 报关重量)。
+
+    飞书里同一个报关行的多行有两种含义，必须分开处理，否则会把金额算成两倍：
+
+    - **完全重复的副本**（金额、重量都一样）→ 只算一次；
+    - **原始行 + 财务拆出来的子行并存**：某一行金额 ≈ 其余去重行之和 → 取该行
+      （原始行没被删掉时，子行是它的拆分，不能再加一遍）；
+    - 其余情况（原始行已被拆分结果替换，只能看到子行）→ 各行相加。
+
+    2026-10-08 案例：`26MT-05X216&217A` 每个报关行在表里都有两份完全相同的记录，
+    相加后报关金额正好是睿贝出运金额的两倍，拆单直接报「子集和无解」。
+    """
+    from decimal import Decimal
+
+    seen: set[tuple] = set()
+    unique: list[tuple] = []
+    for row in rows:
+        amount = _dec_text(row.get("报关金额", row.get("总价")))
+        weight = _dec_text(row.get("报关重量"))
+        key = (amount, weight)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append((amount, weight))
+    if not unique:
+        return "0", "0"
+    if len(unique) > 2:
+        amounts = [amount for amount, _weight in unique]
+        biggest = max(amounts)
+        others = sum(amounts, Decimal(0)) - biggest
+        if abs(biggest - others) <= Decimal("0.05"):
+            weight = next(weight for amount, weight in unique if amount == biggest)
+            return f"{biggest:.2f}", _fmt_number(weight)
+    amount_total = sum((amount for amount, _weight in unique), Decimal(0))
+    weight_total = sum((weight for _amount, weight in unique), Decimal(0))
+    return f"{amount_total:.2f}", _fmt_number(weight_total)
+
+
 def merge_declaration_rows(rows: list[dict]) -> tuple[list[dict], int]:
-    """同 `报关单号 + 合同号 + 报关品名` 的多行 → 合并成一条（金额/重量相加）。"""
+    """同 `报关单号 + 合同号 + 报关品名` 的多行 → 合并成一条。
+
+    金额/重量按 `merge_group_totals`（去重 + 取超集 + 相加）合并，
+    避免「原始行与其拆分结果并存」或「行被复制」时把金额算成两倍。
+    """
+    key_of = _declaration_key
+    slots: list[tuple[str, object]] = []
+    index: dict[tuple[str, str, str], list[dict]] = {}
     out: list[dict] = []
-    index: dict[tuple[str, str, str], dict] = {}
     merged = 0
     for row in rows:
-        declaration = str(row.get("报关单号") or "").strip()
-        key = (declaration,
-               str(row.get("合同号_1") or row.get("合同号（应收表格）") or "").strip(),
-               str(row.get("报关品名") or "").strip())
-        if not declaration or key not in index:
-            copy = dict(row)
-            out.append(copy)
-            if declaration:
-                index[key] = copy
+        key = key_of(row)
+        if key is None:
+            slots.append(("single", row))
             continue
-        target = index[key]
-        target["总价"] = _sum_text(target.get("总价"), row.get("总价"))
-        target["报关重量"] = _sum_text(target.get("报关重量"), row.get("报关重量"))
-        for name in ("申报数量",):
-            if str(row.get(name) or "").strip():
-                target[name] = _sum_text(target.get(name), row.get(name))
-        target["商品序号"] = ""   # 合并后不再是原来那一条拆分记录
-        merged += 1
+        if key not in index:
+            index[key] = []
+            slots.append(("group", key))
+        index[key].append(row)
+    for kind, payload in slots:
+        if kind == "single":
+            out.append(dict(payload))
+            continue
+        members = index[payload]
+        target = dict(members[0])
+        if len(members) > 1:
+            amount, weight = merge_group_totals(members)
+            target["总价"] = amount
+            target["报关重量"] = weight
+            quantities = [row for row in members if str(row.get("申报数量") or "").strip()]
+            if len(quantities) > 1:
+                target["申报数量"] = _fmt_number(
+                    sum((_dec_text(row.get("申报数量")) for row in quantities), _dec_text(0))
+                )
+            target["商品序号"] = ""   # 合并后不再是原来那一条拆分记录
+            merged += len(members) - 1
+        out.append(target)
     return out, merged
+
+
+def _declaration_key(row: dict) -> tuple[str, str, str] | None:
+    declaration = str(row.get("报关单号") or "").strip()
+    if not declaration:
+        return None
+    return (declaration,
+            str(row.get("合同号_1") or row.get("合同号（应收表格）") or "").strip(),
+            str(row.get("报关品名") or "").strip())
 
 
 def parse_pdfs(pdf_paths: list[Path], out_xlsx: Path) -> dict:

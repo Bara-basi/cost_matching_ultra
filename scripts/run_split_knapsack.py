@@ -411,6 +411,11 @@ def allocate_weight(
 # 报关 48840.75 vs 出运单 48840.74），留一点点余量但不至于认错单
 AMOUNT_MATCH_CENTS = 5
 
+# `verified_conflicts.json` 里的 `类别`。这一类的意思是「睿贝没有这批数据」，
+# 属于**算不出来**的异常，不是核实过的冲突：要照常报给财务，不能当「已核实」
+# 把它从结果里抹掉（2026-10-10 用户口径）。
+ERP_MISSING_CATEGORY = "睿贝缺数据"
+
 _ADD_SUFFIX_RE = re.compile(r"-?ADD\d*", re.IGNORECASE)
 
 
@@ -2020,12 +2025,19 @@ def run(
     # 只是供应商集合一致，事后核实整张单的数据都是错的（如 25MT-03R625Y）。
     verified_path = PROJECT_ROOT / "data" / "reference" / "verified_conflicts.json"
     verified: list[dict] = []
+    erp_missing: list[dict] = []
     if verified_path.exists():
         cases = json.loads(verified_path.read_text(encoding="utf-8")).get("cases") or []
         # 核实是按**整张报关单**核的（人工核实结论本来就是针对这张单的），
         # 所以以报关单号为键：混装单的报关品名会按实际品名改写，用「报关单号+品名」
         # 当键会在改写后失配。
-        index = {str(case.get("报关单号") or ""): case for case in cases}
+        index: dict[str, dict] = {}
+        for case in cases:
+            # 「睿贝缺数据」= 睿贝没有这批货的单据 → 走异常表，不算已核实。
+            if str(case.get("类别") or "").strip() == ERP_MISSING_CATEGORY:
+                erp_missing.append(case)
+                continue
+            index[str(case.get("报关单号") or "")] = case
         for source in ("bad", "same", "missing"):
             rows = {"bad": bad, "same": same, "missing": missing}[source]
             remaining: list[dict] = []
@@ -2051,6 +2063,7 @@ def run(
                 same = remaining
     else:
         index = {}
+        erp_missing = []
         print("（未找到 data/reference/verified_conflicts.json，跳过已核实冲突分列）")
 
     detail_columns = [
@@ -2109,9 +2122,12 @@ def run(
     )
     # 本地异常（不依赖飞书比对）：拆不出/多解/未落到报关行 + ERP 自身矛盾。
     # 已人工核实的报关单不再算「未解决异常」（它们在拆单结果_已核实.xlsx 里）。
+    erp_missing_decls = {str(case.get("报关单号") or "") for case in erp_missing}
     local_bad: list[dict] = []
     for row in failures:
         if index.get(str(row.get("报关单号") or "")):
+            continue
+        if str(row.get("报关单号") or "") in erp_missing_decls:
             continue
         local_bad.append(
             {
@@ -2125,6 +2141,8 @@ def run(
     for row in data_anomalies:
         if index.get(str(row.get("报关单号") or "")):
             continue
+        if str(row.get("报关单号") or "") in erp_missing_decls:
+            continue
         local_bad.append(
             {
                 "类型": "ERP数据矛盾",
@@ -2133,6 +2151,22 @@ def run(
                 "报关品名": row.get("报关品名"),
                 "采购单号": row.get("采购单号"),
                 "说明": row.get("比对结果"),
+            }
+        )
+    # 睿贝没有这批数据的报关行为「异常·睿贝缺数据」（不是已核实），保证它在结果里露面。
+    # 只补**本轮报关单里出现过**的（区间核算只选了一部分单，不能把全库的缺数据单都塞进结果）。
+    in_scope = {str(line.declaration_no or "") for line in declared}
+    for case in erp_missing:
+        if str(case.get("报关单号") or "") not in in_scope:
+            continue
+        local_bad.append(
+            {
+                "类型": ERP_MISSING_CATEGORY,
+                "报关单号": case.get("报关单号"),
+                "合同号_1": case.get("合同号_1"),
+                "报关品名": case.get("报关品名"),
+                "采购单号": "",
+                "说明": case.get("结论") or "睿贝里没有这批货的出运单或产品行，成本算不出来。",
             }
         )
     write_rows(

@@ -118,11 +118,16 @@ def _short_basis(basis: str) -> str:
 
 
 LOCAL_EXCEPTION_FILE = "拆单_本地异常.xlsx"
+# 与 `scripts/run_split_knapsack.ERP_MISSING_CATEGORY` 同一口径：
+# 睿贝没有这批数据 = 算不出来的异常，不是「已核实」。
+ERP_MISSING_TYPE = "睿贝缺数据"
 
 
-def _friendly_local_note(note: str) -> tuple[str, str]:
+def _friendly_local_note(note: str, row_type: str = "") -> tuple[str, str]:
     """拆单引擎的本地异常说明 → 一句给财务看的话（异常类型, 异常明细）。"""
     text = str(note or "").strip()
+    if str(row_type or "").strip() == ERP_MISSING_TYPE:
+        return ERP_MISSING_TYPE, text[:80] or "睿贝里没有这批货的出运单或产品行，成本算不出来。"
     if "无出运产品行" in text:
         return "找不到出运单", "睿贝里没有这张出运单（可能还没生成），这条成本算不出来，请先核对合同号。"
     if "没有这张出运单" in text:
@@ -152,7 +157,7 @@ def _local_exception_rows(split_xlsx: Path) -> list[dict]:
     for item in read_split_rows(path):
         contract = str(item.get("合同号_1") or "").strip()
         note = str(item.get("说明") or "").strip()
-        kind, detail = _friendly_local_note(note)
+        kind, detail = _friendly_local_note(note, str(item.get("类型") or ""))
         purchase = str(item.get("采购单号") or "").strip()
         purchase_link, shipment_link = erp_links(purchase, contract)
         out.append(

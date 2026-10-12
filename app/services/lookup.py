@@ -507,6 +507,79 @@ def declarations_from_rows(rows: list[dict]) -> list[dict]:
     return out
 
 
+def contract_tokens(rows: list[dict]) -> set[str]:
+    """把若干行的 `合同号_1` 拆成出运单记号集合（联合号按 & , ； 拆开）。"""
+    tokens: set[str] = set()
+    for row in rows:
+        for token in re.split(r"[&,，;；\s]+", _text(row.get("合同号_1"))):
+            if token.strip():
+                tokens.add(token.strip())
+    return tokens
+
+
+def order_cores(rows: list[dict]) -> set[str]:
+    """提交行所属的**订单核心**（`26MT-06N121A` → `26MT-06N121`）。
+
+    同一条出运单常按批次/附加单拆成多张报关单，`合同号_1` 只差尾缀
+    （`…-A` / `…A` / `…-ADD1`）；只按合同号原文找兄弟报关行会漏，所以要按核心再找一遍。
+    """
+    from app.services.parser.output_columns import derive_contract
+
+    cores: set[str] = set()
+    for token in contract_tokens(rows):
+        core = derive_contract(token)
+        if core and core != token:
+            cores.add(core)
+    return cores
+
+
+def related_rows(rows: list[dict]) -> list[dict]:
+    """逐条核验补上下文：把提交行所属出运单（合同号）下的**其它报关行**也取回来。
+
+    逐条核验一次最多 50 行，而一条出运单的货常拆在多张报关单上；只拿提交的几张去
+    拆单，货池不完整就会多摊 / 少摊 / 补出多余的补充行。这里按合同号从飞书把同
+    出运单的其它报关行补成**上下文行**（只参与核算，不进结果、不写回）。
+    飞书不可达时返回空表，退回原行为。
+    """
+    contracts = contract_tokens(rows) | order_cores(rows)
+    if not contracts:
+        return []
+    try:
+        _by_decl, by_contract, _label, _warnings = _fetch(set(), contracts)
+    except Exception:  # noqa: BLE001  拿不到飞书就用原输入，绝不因此报错
+        return []
+    submitted = {(_text(row.get("报关单号")), _text(row.get("报关品名"))) for row in rows}
+    out: list[dict] = []
+    seen: set[tuple] = set()
+    for records in by_contract.values():
+        for record in _collapse_records(records):
+            fields = record.get("fields") or {}
+            declaration = _text(fields.get("报关单号"))
+            name = _text(fields.get("报关品名"))
+            if not declaration or (declaration, name) in submitted:
+                continue
+            key = (declaration, _text(fields.get("合同号_1")), name)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(
+                {
+                    "来源文件": "逐单核验上下文",
+                    "合同号_1": _text(fields.get("合同号_1")),
+                    "报关单号": declaration,
+                    "商品序号": "",
+                    "报关品名": name,
+                    "海关编码": _text(fields.get("海关编码")),
+                    "报关重量": _amount_text(fields.get("报关重量")),
+                    "申报数量": "",
+                    "申报单位": "",
+                    "总价": _amount_text(fields.get("报关金额")),
+                    "币种": _text(fields.get("币种")),
+                }
+            )
+    return out
+
+
 def validate_rows(rows: list[dict]) -> list[str]:
     """提交前的最小校验：缺关键字段就明确告诉用户缺什么。"""
     errors = []

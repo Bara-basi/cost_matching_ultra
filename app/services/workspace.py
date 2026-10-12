@@ -34,6 +34,34 @@ _WORKER_LOCK = threading.Lock()
 _CANCELLED: set[str] = set()
 
 
+def _contract_tokens(rows: list[dict]) -> set[str]:
+    """把若干行的 `合同号_1` 拆成出运单记号集合（联合号按 & , ； 拆开）。"""
+    import re
+
+    tokens: set[str] = set()
+    for row in rows:
+        for token in re.split(r"[&,，;；\s]+", str(row.get("合同号_1") or "")):
+            if token.strip():
+                tokens.add(token.strip())
+    return tokens
+
+
+def _belongs_to_selection(row: dict, numbers: set[str], contracts: set[str]) -> bool:
+    """结果行是否属于本次提交的报关单（上下文行只参与核算、不进结果）。
+
+    有报关单号按单号判；报关单号为空的补充行按合同号判，避免把本次提交那几张的
+    同出运单补充行一起丢掉。
+    """
+    import re
+
+    number = str(row.get("报关单号") or "").strip()
+    if number:
+        return number in numbers
+    tokens = {token.strip() for token in re.split(r"[&,，;；\s]+", str(row.get("合同号_1") or ""))
+              if token.strip()}
+    return bool(tokens & contracts)
+
+
 def _shortage(key: str, entry: dict) -> str:
     """一句给财务看的缺口说明：报关金额 vs 出运总金额、差多少、其中多少是客户费用。"""
     from decimal import Decimal
@@ -277,7 +305,19 @@ def _run_active(job_id: str, kind: str, files: list[Path], declarations: list[di
 
     try:
         _update(job_id, state="running", progress=8, message="正在准备报关数据")
+        context_rows: list[dict] = []
         if declarations:
+            selected_numbers = {str(item.get("报关单号") or "").strip() for item in declarations}
+            selected_contracts = _contract_tokens(declarations)
+            if kind == "lookup":
+                # 逐条核验一次最多 50 行，同一条出运单的货常拆在多张报关单上；
+                # 按合同号把同出运单的其它报关行补成上下文，避免货池不完整导致多摊/少摊。
+                from app.services import lookup as _lookup
+
+                context_rows = _lookup.related_rows(declarations)
+                if context_rows:
+                    declarations = declarations + context_rows
+                    _update(job_id, message=f"已自动补入同出运单其它报关行 {len(context_rows)} 条参与核算")
             parse_xlsx = run_dir / "报关输入.xlsx"
             kept = pipeline.write_declarations(declarations, parse_xlsx)
             if not kept:
@@ -354,6 +394,10 @@ def _run_active(job_id: str, kind: str, files: list[Path], declarations: list[di
 
         _update(job_id, progress=70, message="正在匹配采购成本（入库单实发）")
         rows = pipeline.review_rows(split_xlsx)
+        if context_rows:
+            # 上下文行只参与核算：结果里只保留本次提交的报关单（及同合同的补充行）。
+            rows = [row for row in rows
+                    if _belongs_to_selection(row, selected_numbers, selected_contracts)]
         if halt_if_cancelled():
             return
 

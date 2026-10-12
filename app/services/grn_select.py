@@ -38,6 +38,7 @@ from app.services.grn_extract import (
 LIST_DIR = CACHE_ROOT / "attachments" / "lists"
 MANIFEST = CACHE_ROOT / "attachments" / "grn_manifest.json"
 PURCHASES = CACHE_ROOT / "purchases" / "purchases.jsonl"
+GRN_DIR = CACHE_ROOT / "attachments" / "grn"
 
 _ERP_AMOUNTS: dict[str, Decimal] | None = None
 _ERP_SUPPLIERS: dict[str, str] | None = None
@@ -374,8 +375,33 @@ def disk_to_original() -> dict[str, str]:
     return mapping
 
 
+def ensure_parsed(purchase_code: str) -> None:
+    """入库单附件已下载但还没解析时，就地补解析（规则优先，模型兜底）。
+
+    背景（2026-10-08）：成本匹配只读 `attachments/parsed/`，而同步默认只下载附件、
+    不跑解析；当服务器上只剩少数几个采购单的解析缓存时，明明有入库单的单子会被
+    误判成「缺入库单」。这里保证「本地有附件就先解析」，让误判不再出现。
+    """
+    folder = PARSED_ROOT / safe_name(purchase_code)
+    if folder.exists() and any(folder.glob("*.json")):
+        return
+    source = GRN_DIR / safe_name(purchase_code)
+    if not source.is_dir():
+        return
+    from app.services.grn_extract import extract_attachment
+
+    for path in sorted(entry for entry in source.iterdir() if entry.is_file()):
+        if path.suffix.lower() not in (".xlsx", ".xls", ".pdf", ".jpg", ".jpeg", ".png"):
+            continue
+        try:
+            extract_attachment(path, purchase_code=purchase_code, use_model=True)
+        except Exception:  # noqa: BLE001 —— 单份附件解析失败不应拖垮成本匹配
+            continue
+
+
 def load_items(purchase_code: str) -> list[Item]:
     """读出一个采购单下所有已解析附件，按附件栏顺序（越靠后越新）。"""
+    ensure_parsed(purchase_code)
     folder = PARSED_ROOT / safe_name(purchase_code)
     if not folder.exists():
         return []

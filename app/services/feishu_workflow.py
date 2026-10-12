@@ -103,6 +103,13 @@ def _item_key(item):
     return (item["报关单号"], item["合同号_1"], item["报关品名"])
 
 
+def _merge_group_totals(items):
+    """同报关单号+合同号+品名的多行合计（去重 + 取超集 + 相加，见 pipeline.merge_group_totals）。"""
+    from app.services.pipeline import merge_group_totals
+
+    return merge_group_totals(items)
+
+
 def select_records(*, start_date="", end_date="", declarations="", contracts="", limit=50):
     for value in (start_date, end_date):
         if value:
@@ -194,8 +201,9 @@ def select_records(*, start_date="", end_date="", declarations="", contracts="",
                                          if item["record_id"] != source["record_id"]]
             consumed.update(source["mergedRecordIds"])
             if all(not _input_reason(item) for item in siblings):
-                source["报关金额"] = f"{sum((_amount(item['报关金额']) for item in siblings), Decimal(0)):.2f}"
-                source["报关重量"] = f"{sum((feishu_compare.number(item['报关重量']) for item in siblings), Decimal(0))}"
+                amount, weight = _merge_group_totals(siblings)
+                source["报关金额"] = amount
+                source["报关重量"] = weight
                 if any(item["采购金额"] for item in siblings):
                     source["writebackBlocked"] = "同商品历史行已有采购金额，请复核后处理"
             else:
@@ -243,8 +251,9 @@ def select_records(*, start_date="", end_date="", declarations="", contracts="",
                 continue
             if all(not _input_reason(item) for item in group):
                 merged = group[0]
-                merged["报关金额"] = f"{sum((_amount(item['报关金额']) for item in group), Decimal(0)):.2f}"
-                merged["报关重量"] = f"{sum((feishu_compare.number(item['报关重量']) for item in group), Decimal(0))}"
+                amount, weight = _merge_group_totals(group)
+                merged["报关金额"] = amount
+                merged["报关重量"] = weight
                 merged["mergedRecordIds"] = [item["record_id"] for item in group if item is not merged]
                 compact_context.append(merged)
             else:
