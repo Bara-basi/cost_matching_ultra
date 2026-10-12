@@ -11,6 +11,7 @@ from openpyxl import Workbook, load_workbook
 
 SCHEMA_PATH = Path(__file__).with_name("feishu_copy_schema.json")
 INPUT_COLUMNS = ("报关单号", "合同号_1", "报关品名", "报关金额", "币种", "报关重量")
+OPTIONAL_INPUT_COLUMNS = ("商品序号", "海关编码", "产品类型", "申报数量", "申报单位", "采购订单号")
 REQUIRED = INPUT_COLUMNS
 
 
@@ -57,7 +58,7 @@ def read_template(path: Path, *, limit: int | None = None) -> tuple[list[dict], 
             if not any(value is not None and str(value).strip() for value in values):
                 continue
             row = {name: str(values[i] if i < len(values) and values[i] is not None else "").strip()
-                   for i, name in enumerate(header) if name in INPUT_COLUMNS or name == "采购订单号"}
+                   for i, name in enumerate(header) if name in INPUT_COLUMNS or name in OPTIONAL_INPUT_COLUMNS}
             empty = [name for name in REQUIRED if not row.get(name)]
             if empty:
                 errors.append({"row": line, "message": "必填值为空：" + "、".join(empty)})

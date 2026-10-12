@@ -19,7 +19,7 @@ from pydantic import BaseModel
 from app.services import erp_sync, lookup, workspace
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-APP_VERSION = "2026.09.30-api.2"
+APP_VERSION = "2026.10.12-api.2"
 
 app = FastAPI(title="成本匹配工作台", version=APP_VERSION)
 WEB_DIST = PROJECT_ROOT / "web" / "dist"
@@ -183,7 +183,7 @@ async def lookup_start(rows: str = Form("[]"), use_ai: bool = Form(False)) -> di
     if not declarations:
         raise HTTPException(status_code=400, detail="请至少填写一行报关商品")
     if len(declarations) > 50:
-        raise HTTPException(status_code=400, detail="逐条核验每次最多 50 条")
+        raise HTTPException(status_code=400, detail="逐条核验每次最多 50 条；同一完整出运批次超过上限时请使用模板文件")
     errors = lookup.validate_rows(items)
     if errors:
         raise HTTPException(status_code=400, detail="；".join(errors[:5]))

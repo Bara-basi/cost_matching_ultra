@@ -34,58 +34,6 @@ _WORKER_LOCK = threading.Lock()
 _CANCELLED: set[str] = set()
 
 
-def _contract_tokens(rows: list[dict]) -> set[str]:
-    """把若干行的 `合同号_1` 拆成出运单记号集合（联合号按 & , ； 拆开）。"""
-    import re
-
-    tokens: set[str] = set()
-    for row in rows:
-        for token in re.split(r"[&,，;；\s]+", str(row.get("合同号_1") or "")):
-            if token.strip():
-                tokens.add(token.strip())
-    return tokens
-
-
-def _belongs_to_selection(row: dict, numbers: set[str], contracts: set[str]) -> bool:
-    """结果行是否属于本次提交的报关单（上下文行只参与核算、不进结果）。
-
-    有报关单号按单号判；报关单号为空的补充行按合同号判，避免把本次提交那几张的
-    同出运单补充行一起丢掉。
-    """
-    import re
-
-    number = str(row.get("报关单号") or "").strip()
-    if number:
-        return number in numbers
-    tokens = {token.strip() for token in re.split(r"[&,，;；\s]+", str(row.get("合同号_1") or ""))
-              if token.strip()}
-    return bool(tokens & contracts)
-
-
-def _shortage(key: str, entry: dict) -> str:
-    """一句给财务看的缺口说明：报关金额 vs 出运总金额、差多少、其中多少是客户费用。"""
-    from decimal import Decimal
-
-    def money(value) -> str:
-        try:
-            return f"{Decimal(str(value or 0)):,.2f}"
-        except Exception:  # noqa: BLE001
-            return str(value or 0)
-
-    gap = abs(Decimal(str(entry.get("gap") or 0)))
-    fee = abs(Decimal(str(entry.get("fee") or 0)))
-    total = entry.get("total") or 0
-    declared = entry.get("declared") or 0
-    if total:
-        text = (f"{key}：报关金额合计 {money(declared)}、出运总金额 {money(total)}，"
-                f"还差 {money(gap)}")
-    else:
-        text = f"{key}：金额对不上，还差 {money(gap)}"
-    if fee:
-        text += f"（其中客户费用 {money(fee)}）"
-    return text + "；请补齐对应的报关单再核对。"
-
-
 def _status_path(job_id: str) -> Path:
     return JOBS_DIR / job_id / "status.json"
 
@@ -290,6 +238,71 @@ def _run(job_id: str, kind: str, files: list[Path], declarations: list[dict], us
         _run_active(job_id, kind, files, declarations, use_ai)
 
 
+def _sync_calculation(job_id: str, inputs: list[dict], run_dir: Path, stopped) -> tuple[list[dict], dict]:
+    """飞书按共享出运批次隔离失败，成功批次汇总后统一调用离线成本分摊。"""
+    from app.services.shipment_detail import shipment_invoices_for_contract, strip_pi
+    from app.services.contract_shipments import expand_contract
+
+    groups = []
+    for contract in dict.fromkeys(str(row.get("合同号_1") or "").strip() for row in inputs):
+        keys = {strip_pi(invoice).upper() for invoice in shipment_invoices_for_contract(contract)}
+        keys.update(token.upper() for token in expand_contract(contract))
+        group = {"contracts": {contract}, "keys": keys}
+        remaining = []
+        for other in groups:
+            if group["keys"] & other["keys"]:
+                group["keys"].update(other["keys"])
+                group["contracts"].update(other["contracts"])
+            else:
+                remaining.append(other)
+        groups = remaining + [group]
+
+    accepted, rejected, errors = [], [], []
+    stats = {"batches": len(groups), "calculatedBatches": 0, "rejectedBatches": 0}
+    for index, group in enumerate(groups):
+        if stopped():
+            return [], stats
+        batch_rows = [row for row in inputs if str(row.get("合同号_1") or "").strip() in group["contracts"]]
+        batch_dir = run_dir / "batches" / str(index + 1)
+        parse_path = batch_dir / "报关输入.xlsx"
+        pipeline.write_declarations(batch_rows, parse_path)
+        _update(job_id, progress=35 + int(30 * index / max(1, len(groups))),
+                message=f"正在核验并拆单：出运批次 {index + 1} / {len(groups)}")
+        try:
+            pipeline.validate_input_completeness(parse_path)
+            split_dir = batch_dir / "shipments_split"
+            pipeline.run_round(parse_path, split_dir)
+            split_path = split_dir / "拆单明细_全部.xlsx"
+            if not split_path.exists():
+                raise pipeline.BatchCalculationError([{"原因": "拆单没有产出结果，请核对该批合同号和报关商品行。"}], reason="split_failed")
+            pipeline.validate_split_completeness(split_dir)
+        except pipeline.BatchCalculationError as exc:
+            label = " / ".join(sorted(group["contracts"]))
+            errors.extend({**issue, "批次合同": label} for issue in exc.issues)
+            reason = "；".join(issue["原因"] for issue in exc.issues)
+            for row in batch_rows:
+                if row.get("contextOnly"):
+                    continue
+                rejected.append({**row, "报关金额": row.get("报关金额") or row.get("总价"),
+                                 "采购金额": None, "异常类型": "未核算", "异常明细": reason,
+                                 "分摊依据": "", "_未核算": True})
+            stats["rejectedBatches"] += 1
+        else:
+            accepted.extend(_read_sheet(split_path))
+            stats["calculatedBatches"] += 1
+
+    _update(job_id, inputErrors=errors, batchSummary=stats)
+    rows = []
+    if accepted and not stopped():
+        # 保留离线按采购单跨批次的分摊口径；不能逐批计算成本再相加。
+        split_path = run_dir / "shipments_split" / "拆单明细_全部.xlsx"
+        columns = list(dict.fromkeys(key for row in accepted for key in row))
+        _write_xlsx(accepted, split_path, columns)
+        _update(job_id, progress=70, message="正在匹配完整批次的采购成本（入库单实发）")
+        rows = pipeline.review_rows(split_path)
+    return rows + rejected, stats
+
+
 def _run_active(job_id: str, kind: str, files: list[Path], declarations: list[dict], use_ai: bool) -> None:
     run_dir = pipeline.new_run_dir(job_id)
 
@@ -305,19 +318,7 @@ def _run_active(job_id: str, kind: str, files: list[Path], declarations: list[di
 
     try:
         _update(job_id, state="running", progress=8, message="正在准备报关数据")
-        context_rows: list[dict] = []
         if declarations:
-            selected_numbers = {str(item.get("报关单号") or "").strip() for item in declarations}
-            selected_contracts = _contract_tokens(declarations)
-            if kind == "lookup":
-                # 逐条核验一次最多 50 行，同一条出运单的货常拆在多张报关单上；
-                # 按合同号把同出运单的其它报关行补成上下文，避免货池不完整导致多摊/少摊。
-                from app.services import lookup as _lookup
-
-                context_rows = _lookup.related_rows(declarations)
-                if context_rows:
-                    declarations = declarations + context_rows
-                    _update(job_id, message=f"已自动补入同出运单其它报关行 {len(context_rows)} 条参与核算")
             parse_xlsx = run_dir / "报关输入.xlsx"
             kept = pipeline.write_declarations(declarations, parse_xlsx)
             if not kept:
@@ -367,6 +368,12 @@ def _run_active(job_id: str, kind: str, files: list[Path], declarations: list[di
 
         if halt_if_cancelled():
             return
+        if parse_stats.get("failed"):
+            raise pipeline.BatchCalculationError([
+                {"文件": item.get("文件", ""),
+                 "原因": f"{item.get('文件', '报关单')}：报关单解析失败，输入不完整，请补齐或修正后重新提交。"}
+                for item in parse_stats["failed"]
+            ])
         input_path = JOBS_DIR / job_id / "input_rows.json"
         if not input_path.exists() and parse_xlsx.exists():
             book = load_workbook(parse_xlsx, read_only=True, data_only=True)
@@ -378,40 +385,30 @@ def _run_active(job_id: str, kind: str, files: list[Path], declarations: list[di
                 input_path.write_text(json.dumps(inputs, ensure_ascii=False, default=str), encoding="utf-8")
             finally:
                 book.close()
-        _update(job_id, progress=45, message="正在拆单（按采购订单 / 供应商 / 产品类型）")
-        split_dir = run_dir / "shipments_split"
-        # 缺报关单不再挡住计算：没有报关单认领的产品行，用睿贝出运明细补出补充报关行后再跑一轮
-        round_result = pipeline.run_round(parse_xlsx, split_dir)
-        if halt_if_cancelled():
-            return
-        stats = round_result.get("stats") or {}
-        supplemented = int(round_result.get("supplemented") or 0)
-        if supplemented:
-            _update(job_id, message=f"已用睿贝出运明细补充 {supplemented} 条报关行后重算")
-        split_xlsx = split_dir / "拆单明细_全部.xlsx"
-        if not split_xlsx.exists():
-            raise ValueError("拆单没有产出结果，请检查合同号是否属于本期范围")
+        if kind == "sync":
+            rows, stats = _sync_calculation(job_id, declarations, run_dir, stopped)
+            if halt_if_cancelled():
+                return
+        else:
+            _update(job_id, progress=35, message="正在核验本批报关输入是否齐全")
+            pipeline.validate_input_completeness(parse_xlsx)
+            if halt_if_cancelled():
+                return
+            _update(job_id, progress=45, message="正在拆单（按采购订单 / 供应商 / 产品类型）")
+            split_dir = run_dir / "shipments_split"
+            round_result = pipeline.run_round(parse_xlsx, split_dir)
+            if halt_if_cancelled():
+                return
+            stats = round_result.get("stats") or {}
+            split_xlsx = split_dir / "拆单明细_全部.xlsx"
+            if not split_xlsx.exists():
+                raise ValueError("拆单没有产出结果，请检查合同号是否属于本期范围")
+            pipeline.validate_split_completeness(split_dir)
 
-        _update(job_id, progress=70, message="正在匹配采购成本（入库单实发）")
-        rows = pipeline.review_rows(split_xlsx)
-        if context_rows:
-            # 上下文行只参与核算：结果里只保留本次提交的报关单（及同合同的补充行）。
-            rows = [row for row in rows
-                    if _belongs_to_selection(row, selected_numbers, selected_contracts)]
-        if halt_if_cancelled():
-            return
-
-        # 出运单金额与报关金额对不上时（例如报关单未到齐），只做记录级提示，不再拒绝计算
-        receivable = pipeline.scan_receivable(rows)
-        blocked = {key: entry for key, entry in receivable.items()
-                   if entry["missing"] and entry["fee_bad"]}
-        if blocked:
-            for row in rows:
-                key = str(row.get("合同号_1") or "")
-                entry = blocked.get(key)
-                if entry:
-                    row["异常类型"] = "出运单有额外费用"
-                    row["异常明细"] = _shortage(key, entry)
+            _update(job_id, progress=70, message="正在匹配采购成本（入库单实发）")
+            rows = pipeline.review_rows(split_xlsx)
+            if halt_if_cancelled():
+                return
 
         _update(job_id, progress=92, message="正在整理结果")
         from app.services.review import summary as review_summary
@@ -432,9 +429,16 @@ def _run_active(job_id: str, kind: str, files: list[Path], declarations: list[di
         if halt_if_cancelled():
             return
         _update(
-            job_id, state="complete", progress=100, message="处理完成", summary=payload,
+            job_id, state="complete", progress=100,
+            message=(f"处理完成：{stats['calculatedBatches']} 个批次已核算，{stats['rejectedBatches']} 个批次未核算，请查看异常原因"
+                     if kind == "sync" else "处理完成"), summary=payload,
             parse=parse_stats, split=stats,
         )
+    except pipeline.BatchCalculationError as exc:
+        if halt_if_cancelled():
+            return
+        _update(job_id, state="failed", message=str(exc), progress=100,
+                failureReason=exc.reason, inputErrors=exc.issues)
     except Exception as exc:  # noqa: BLE001
         if stopped():
             _update(job_id, state="cancelled", message="任务已取消")

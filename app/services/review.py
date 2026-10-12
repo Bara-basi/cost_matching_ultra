@@ -20,11 +20,7 @@ from pathlib import Path
 from openpyxl import load_workbook
 
 from app.services.cost_match import (
-    RecordCost,
-    allocate_amounts,
-    costs_for,
     dec,
-    record_batch_token,
     shipment_money,
 )
 from app.services.erp_cache import CACHE_ROOT
@@ -73,39 +69,10 @@ def purchase_key(code: str) -> str:
 
 
 def allocate_costs(rows: list[dict]) -> list[dict]:
-    """按采购单分组，把入库单实发金额摊到每条记录（同 `build_cost_match` 的口径）。"""
-    money = shipment_money()
-    by_po: dict[str, list[int]] = collections.defaultdict(list)
-    for index, row in enumerate(rows):
-        by_po[str(row.get("采购单号") or "").strip()].append(index)
-    totals = costs_for(list(by_po)) if by_po else {}
-    out: list[dict] = [{} for _ in rows]
-    for code, indexes in by_po.items():
-        total, detail = totals.get(code, (Decimal(0), {}))
-        batch_amounts = {
-            key: dec(value) for key, value in (detail.get("batch_amounts") or {}).items()
-        }
-        costs = [
-            RecordCost(
-                amount_rmb=dec(rows[index].get("出运采购金额合计")),
-                amount_usd=dec(rows[index].get("出运金额合计")),
-                batch=record_batch_token(rows[index].get("合同号_1"), code),
-                product_type=str(rows[index].get("产品类型") or "").strip(),
-                purchase_code=code,
-            )
-            for index in indexes
-        ]
-        amounts = allocate_amounts(
-            costs,
-            total,
-            batch_amounts,
-            money.rmb_by_kind,
-            money.usd_by_po.get(code),
-            money.rmb_by_po.get(code),
-        )
-        for index, (amount, basis) in zip(indexes, amounts):
-            out[index] = {"amount": amount, "basis": basis, "total": total, "detail": detail}
-    return out
+    """界面直接复用离线核算的正式金额分摊逻辑（amount），不读取历史结果。"""
+    from scripts.build_cost_match import allocate_all
+
+    return allocate_all(rows, policy="amount")
 
 
 def _short_basis(basis: str) -> str:

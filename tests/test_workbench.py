@@ -12,10 +12,306 @@ from fastapi.testclient import TestClient
 from openpyxl import Workbook, load_workbook
 
 from app.main import app
-from app.services import contract_shipments, feishu_workflow, lookup, review, shipment_detail, template_import, workspace
+from app.services import contract_shipments, feishu_workflow, lookup, pipeline, review, shipment_detail, template_import, workspace
 
 
 class WorkbenchTests(unittest.TestCase):
+    def test_lookup_incomplete_input_rejects_before_split_without_fetching_context(self):
+        rows = [{"报关单号": "223120260000174064", "合同号_1": "26MT-01A001",
+                 "报关品名": "钢管", "总价": "100", "币种": "USD"}]
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(workspace, "JOBS_DIR", Path(directory) / "jobs"), \
+             patch.object(pipeline, "RUNS_DIR", Path(directory) / "runs"), \
+             patch.object(shipment_detail, "shipment_invoices_for_contract", return_value=["PI-26MT-01A001"]), \
+             patch.object(shipment_detail, "load_shipment_detail", return_value={"baseInfo": {"出运总金额": "150", "币种": "USD"}, "expenseList": []}), \
+             patch.object(lookup, "_fetch", side_effect=AssertionError("must not fetch context")) as related, \
+             patch.object(pipeline, "run_round") as split, patch.object(pipeline, "review_rows") as costs:
+            workspace._update("incomplete", id="incomplete", kind="lookup", state="queued")
+            workspace._run_active("incomplete", "lookup", [], rows, False)
+            status = workspace.get_job("incomplete")
+            self.assertEqual(status["state"], "failed")
+            self.assertEqual(status["failureReason"], "incomplete_input")
+            self.assertIn("少 50.00", status["inputErrors"][0]["原因"])
+            self.assertFalse((workspace.JOBS_DIR / "incomplete" / "rows.json").exists())
+            self.assertEqual(TestClient(app).get("/api/jobs/incomplete/rows").status_code, 404)
+            related.assert_not_called()
+            split.assert_not_called()
+            costs.assert_not_called()
+
+    def test_input_completeness_groups_joint_and_individual_contracts_without_double_counting(self):
+        mapping = {"26MT-01A001&002": ["PI-26MT-01A001", "PI-26MT-01A002"],
+                   "26MT-01A001": ["PI-26MT-01A001"], "26MT-01A002": ["PI-26MT-01A002"]}
+        def detail(invoice):
+            return {"baseInfo": {"出运总金额": "100" if invoice.endswith("001") else "50", "币种": "USD"}}
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(shipment_detail, "shipment_invoices_for_contract", side_effect=lambda code: mapping[code]), \
+             patch.object(shipment_detail, "load_shipment_detail", side_effect=detail):
+            path = Path(directory) / "input.xlsx"
+            rows = [{"报关单号": str(223120260000174064+i), "合同号_1": contract,
+                     "报关品名": "钢管", "总价": amount, "币种": "USD"}
+                    for i, (contract, amount) in enumerate([(list(mapping)[0], "70"), (list(mapping)[1], "50"), (list(mapping)[2], "30")])]
+            pipeline.write_declarations(rows, path)
+            pipeline.validate_input_completeness(path)
+            rows.pop()
+            pipeline.write_declarations(rows, path)
+            with self.assertRaises(pipeline.BatchCalculationError) as error:
+                pipeline.validate_input_completeness(path)
+            self.assertIn("少 30.00", str(error.exception))
+
+    def test_missing_erp_details_and_currency_mismatch_never_assume_complete(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(shipment_detail, "shipment_invoices_for_contract", return_value=["PI-26MT-01A001"]):
+            path = Path(directory) / "input.xlsx"
+            pipeline.write_declarations([{"报关单号": "223120260000174064", "合同号_1": "26MT-01A001",
+                                          "报关品名": "钢管", "总价": "100", "币种": "USD"}], path)
+            with patch.object(shipment_detail, "load_shipment_detail", return_value=None):
+                with self.assertRaises(pipeline.BatchCalculationError) as error:
+                    pipeline.validate_input_completeness(path)
+                self.assertIn("缺少睿贝出运明细", str(error.exception))
+            with patch.object(shipment_detail, "load_shipment_detail", return_value={"baseInfo": {"出运总金额": "100", "币种": "EUR"}}):
+                with self.assertRaises(pipeline.BatchCalculationError) as error:
+                    pipeline.validate_input_completeness(path)
+                self.assertIn("币种", str(error.exception))
+
+    def test_input_completeness_keeps_rounding_tolerance_and_rejects_invalid_amounts(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(shipment_detail, "shipment_invoices_for_contract", return_value=["PI-26MT-01A001"]):
+            path = Path(directory) / "input.xlsx"
+            row = {"报关单号": "223120260000174064", "合同号_1": "26MT-01A001",
+                   "报关品名": "钢管", "总价": "100", "币种": "USD"}
+            pipeline.write_declarations([row], path)
+            with patch.object(shipment_detail, "load_shipment_detail", return_value={"baseInfo": {"出运总金额": "101.46", "币种": "USD"}}):
+                pipeline.validate_input_completeness(path)
+            for invalid in ["NaN", "Infinity", "bad"]:
+                with patch.object(shipment_detail, "load_shipment_detail", return_value={"baseInfo": {"出运总金额": invalid}}):
+                    with self.assertRaises(pipeline.BatchCalculationError) as error:
+                        pipeline.validate_input_completeness(path)
+                    self.assertIn("出运总金额无效", str(error.exception))
+                pipeline.write_declarations([{**row, "总价": invalid}], path)
+                with self.assertRaises(pipeline.BatchCalculationError):
+                    pipeline.validate_input_completeness(path)
+                pipeline.write_declarations([row], path)
+
+    def test_run_round_preserves_input_and_never_builds_erp_declarations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "input.xlsx"
+            path.write_bytes(b"unchanged input")
+            with patch.object(pipeline, "run_split", return_value={"拆出记录": 1}) as split:
+                self.assertEqual(pipeline.run_round(path, Path(directory) / "split"), {"stats": {"拆出记录": 1}, "supplemented": 0})
+                split.assert_called_once()
+                self.assertEqual(path.read_bytes(), b"unchanged input")
+
+    def test_unclaimed_twin_already_costed_is_allowed_but_unaccounted_goods_reject_batch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            book = Workbook()
+            book.active.append(["合同号_1", "出运金额", "处理", "采购单号"])
+            book.active.append(["26MT-01A001", "100", "已按孪生行规则补记成本到 26MT-01A001 的记录", "26MT-01A001-HD"])
+            path = folder / "拆单_未认领产品行.xlsx"
+            book.save(path)
+            pipeline.validate_split_completeness(folder)
+            book.active.append(["26MT-01A001", "50", "", "26MT-01A001-HD"])
+            book.save(path)
+            with self.assertRaises(pipeline.BatchCalculationError) as error:
+                pipeline.validate_split_completeness(folder)
+            self.assertIn("不会从睿贝生成报关行", str(error.exception))
+
+    def test_real_goods_sequences_are_not_merged_and_null_amount_falls_back_to_total(self):
+        common = {"报关单号": "223120260000174064", "合同号_1": "26MT-01A001",
+                  "报关品名": "钢管", "报关金额": None, "报关重量": "10"}
+        rows = [{**common, "商品序号": "1", "总价": "40"}, {**common, "商品序号": "2", "总价": "60"}]
+        merged, count = pipeline.merge_declaration_rows(rows)
+        self.assertEqual((len(merged), count), (2, 0))
+        merged, count = pipeline.merge_declaration_rows([{**r, "商品序号": ""} for r in rows])
+        self.assertEqual(merged[0]["总价"], "100.00")
+        self.assertEqual(count, 1)
+        records = [{"record_id": str(i), "fields": {**r, "报关金额": r["总价"]}} for i, r in enumerate(rows)]
+        self.assertEqual(len(lookup._collapse_records(records)), 2)
+
+    def test_template_preserves_real_goods_sequences_and_customs_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "input.xlsx"
+            book = Workbook()
+            book.active.append(list(template_import.INPUT_COLUMNS) + ["商品序号", "海关编码"])
+            for number, amount in [(1, "40"), (2, "60")]:
+                book.active.append(["223120260000174064", "26MT-01A001", "钢管", amount,
+                                    "USD", "10", str(number), "7304419000"])
+            book.save(path)
+            rows, errors = template_import.read_template(path)
+            self.assertFalse(errors)
+            self.assertEqual([r["商品序号"] for r in rows], ["1", "2"])
+            self.assertTrue(all(r["海关编码"] == "7304419000" for r in rows))
+            self.assertEqual(len(pipeline.merge_declaration_rows(rows)[0]), 2)
+
+    def test_lookup_contract_only_never_expands_into_other_declarations(self):
+        sources = [{"record_id": "extra", "fields": {"报关单号": "223120260000174064",
+                    "合同号_1": "26MT-01A001", "报关品名": "钢管", "报关金额": "100"}}]
+        result = lookup.enrich_rows([{"合同号_1": "26MT-01A001"}], sources=sources)
+        self.assertEqual(len(result["rows"]), 1)
+        self.assertFalse(result["rows"][0].get("报关单号"))
+        self.assertIn("不再按合同", result["warnings"][0])
+
+    def test_ui_costs_delegate_to_offline_logic_instead_of_loading_saved_results(self):
+        rows = [{"采购单号": "26MT-01A001-HD"}]
+        with patch("scripts.build_cost_match.allocate_all", return_value=[{"amount": "123"}]) as offline:
+            self.assertEqual(review.allocate_costs(rows), [{"amount": "123"}])
+            offline.assert_called_once_with(rows, policy="amount")
+
+    def test_sync_worker_accepts_complete_real_context_without_erp_supplements(self):
+        rows = [{"报关单号": str(223120260000174064+i), "合同号_1": "26MT-01A001",
+                 "报关品名": "钢管", "总价": str(amount), "币种": "USD"}
+                for i, amount in enumerate([100, 50])]
+        results = [{"报关单号": r["报关单号"], "合同号_1": r["合同号_1"],
+                    "采购订单号": "26MT-01A001-HD", "报关金额": r["总价"],
+                    "采购金额": r["总价"], "异常类型": "正常"} for r in rows]
+        def split(_input, out):
+            out.mkdir(parents=True, exist_ok=True)
+            book = Workbook()
+            book.active.append(["报关单号"])
+            book.active.append([rows[0]["报关单号"]])
+            book.save(out / "拆单明细_全部.xlsx")
+            return {"stats": {"拆出记录": 2}, "supplemented": 0}
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(workspace, "JOBS_DIR", Path(directory) / "jobs"), \
+             patch.object(pipeline, "RUNS_DIR", Path(directory) / "runs"), \
+             patch.object(shipment_detail, "shipment_invoices_for_contract", return_value=["PI-26MT-01A001"]), \
+             patch.object(shipment_detail, "load_shipment_detail", return_value={"baseInfo": {"出运总金额": "150", "币种": "USD"}}), \
+             patch.object(pipeline, "run_round", side_effect=split) as run, \
+             patch.object(pipeline, "review_rows", return_value=results):
+            workspace._update("complete", id="complete", kind="sync", state="queued")
+            workspace._run_active("complete", "sync", [], rows, False)
+            self.assertEqual(workspace.get_job("complete")["state"], "complete")
+            self.assertEqual(workspace.result_rows("complete"), results)
+            self.assertTrue(all(r["报关单号"] for r in workspace.result_rows("complete")))
+            run.assert_called_once()
+
+    def test_sync_isolates_missing_batch_and_allocates_all_successful_batches_together(self):
+        contracts = ["26MT-01A001", "26MT-01A002", "26MT-01A003"]
+        inputs = [{"record_id": f"rec{i}", "报关单号": str(223120260000174064+i),
+                   "合同号_1": code, "报关品名": "钢管", "总价": "100", "报关金额": "100",
+                   "币种": "USD"} for i, code in enumerate(contracts)]
+        def detail(invoice):
+            return {"baseInfo": {"出运总金额": "150" if invoice.endswith("002") else "100", "币种": "USD"}}
+        def split(path, out):
+            out.mkdir(parents=True, exist_ok=True)
+            rows = workspace._read_sheet(path)
+            workspace._write_xlsx([{**r, "采购单号": "shared-po"} for r in rows],
+                                  out / "拆单明细_全部.xlsx", ["报关单号", "合同号_1", "采购单号"])
+            return {"stats": {}, "supplemented": 0}
+        def costs(path):
+            return [{**r, "采购金额": "80", "报关品名": "钢管", "报关金额": "100", "异常类型": "正常"}
+                    for r in workspace._read_sheet(path)]
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(workspace, "JOBS_DIR", Path(directory) / "jobs"), \
+             patch.object(pipeline, "RUNS_DIR", Path(directory) / "runs"), \
+             patch.object(shipment_detail, "shipment_invoices_for_contract", side_effect=lambda c: ["PI-"+c]), \
+             patch.object(shipment_detail, "load_shipment_detail", side_effect=detail), \
+             patch.object(pipeline, "run_round", side_effect=split) as run, \
+             patch.object(pipeline, "review_rows", side_effect=costs) as review_costs:
+            workspace._update("mixed", id="mixed", kind="sync", state="queued")
+            (workspace.JOBS_DIR / "mixed" / "source_records.json").write_text(json.dumps(inputs), encoding="utf-8")
+            workspace._run_active("mixed", "sync", [], inputs, False)
+            status = workspace.get_job("mixed")
+            self.assertEqual(status["state"], "complete")
+            self.assertEqual(status["batchSummary"]["calculatedBatches"], 2)
+            self.assertEqual(status["batchSummary"]["rejectedBatches"], 1)
+            rows = workspace.result_rows("mixed")
+            self.assertEqual(len(rows), 3)
+            self.assertEqual([r["合同号_1"] for r in rows if not r.get("_未核算")], [contracts[0], contracts[2]])
+            self.assertIsNone(rows[-1]["采购金额"])
+            self.assertIn("少 50.00", rows[-1]["异常明细"])
+            self.assertEqual(run.call_count, 2)
+            review_costs.assert_called_once()
+            self.assertEqual(len(workspace._read_sheet(review_costs.call_args.args[0])), 2)
+            proposal = feishu_workflow.plan("mixed")
+            blocked = next(g for g in proposal["groups"] if g["sourceId"] == "rec1")
+            self.assertEqual(blocked["status"], "blocked")
+            book = load_workbook(workspace.download_path("mixed", "exceptions"), read_only=True)
+            self.assertEqual(book.active.max_row, 2)
+            book.close()
+
+    def test_sync_joint_contract_split_failure_isolated_and_all_rejected_never_costed(self):
+        inputs = [{"报关单号": str(223120260000174064+i), "合同号_1": c,
+                   "报关品名": "钢管", "总价": "50", "币种": "USD"}
+                  for i, c in enumerate(["26MT-01A001", "26MT-01A002"])]
+        def split(path, out):
+            out.mkdir(parents=True, exist_ok=True)
+            workspace._write_xlsx(workspace._read_sheet(path), out / "拆单明细_全部.xlsx", list(pipeline.DECLARATION_COLUMNS))
+            workspace._write_xlsx([{"合同号_1": "26MT-01A001", "报关单号": inputs[0]["报关单号"],
+                                   "说明": "无法拆单", "类型": "拆单失败"}],
+                                  out / "拆单_本地异常.xlsx", ["合同号_1", "报关单号", "说明", "类型"])
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(workspace, "JOBS_DIR", Path(directory) / "jobs"), \
+             patch.object(pipeline, "RUNS_DIR", Path(directory) / "runs"), \
+             patch.object(shipment_detail, "shipment_invoices_for_contract", return_value=["PI-26MT-01A001&002"]), \
+             patch.object(shipment_detail, "load_shipment_detail", return_value={"baseInfo": {"出运总金额": "100", "币种": "USD"}}), \
+             patch.object(pipeline, "run_round", side_effect=split), \
+             patch.object(pipeline, "review_rows") as cost:
+            workspace._update("joint", id="joint", kind="sync", state="queued")
+            workspace._run_active("joint", "sync", [], inputs, False)
+            self.assertEqual(workspace.get_job("joint")["batchSummary"], {"batches": 1, "calculatedBatches": 0, "rejectedBatches": 1})
+            self.assertTrue(all(r["_未核算"] and r["采购金额"] is None for r in workspace.result_rows("joint")))
+            cost.assert_not_called()
+
+    def test_partial_pdf_parse_does_not_calculate_surviving_subset(self):
+        def parse(_files, path):
+            pipeline.write_declarations([{"报关单号": "223120260000174064", "合同号_1": "26MT-01A001",
+                                          "报关品名": "钢管", "总价": "100"}], path)
+            return {"rows": 1, "failed": [{"文件": "missing.pdf", "原因": "无法解析"}], "warnings": {}}
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(workspace, "JOBS_DIR", Path(directory) / "jobs"), \
+             patch.object(pipeline, "RUNS_DIR", Path(directory) / "runs"), \
+             patch.object(pipeline, "parse_pdfs", side_effect=parse), \
+             patch.object(pipeline, "validate_input_completeness") as validation, \
+             patch.object(pipeline, "run_round") as split:
+            workspace._update("partial_pdf", id="partial_pdf", kind="files", state="queued")
+            workspace._run_active("partial_pdf", "files", [Path(directory)/"input.pdf"], [], False)
+            status = workspace.get_job("partial_pdf")
+            self.assertEqual(status["state"], "failed")
+            self.assertIn("missing.pdf", status["message"])
+            self.assertFalse((workspace.JOBS_DIR/"partial_pdf"/"rows.json").exists())
+            validation.assert_not_called()
+            split.assert_not_called()
+
+    def test_sync_context_includes_outside_range_parts_of_same_erp_shipment(self):
+        target = {"record_id": "target", "fields": {"报关单号": "223120260000174064",
+                  "合同号_1": "26MT-01A001", "报关品名": "钢管", "报关金额": "100", "采购金额": ""}}
+        outside = {"record_id": "outside", "fields": {"报关单号": "223120260000174065",
+                   "合同号_1": "26MT-01A002", "报关品名": "钢管", "报关金额": "50", "采购金额": "25"}}
+        class FakeClient:
+            def iter_search_records(self, *_args):
+                yield target
+            def search_records(self, _app, _table, query):
+                if query["conditions"][0]["field_name"] == "报关单号":
+                    return [target]
+                self.context_query = query
+                return [target, outside]
+        fake = FakeClient()
+        with patch.object(feishu_workflow, "_target", return_value=(fake, "app", "table")), \
+             patch.object(shipment_detail, "shipment_invoices_for_contract", return_value=["PI-26MT-01A001&002"]):
+            chosen = feishu_workflow.select_records(limit=1)
+        self.assertEqual([r["record_id"] for r in chosen["context"]], ["outside"])
+        self.assertTrue(chosen["context"][0]["contextOnly"])
+        self.assertIn("26MT-01A002", [r["value"][0] for r in fake.context_query["conditions"]])
+
+    def test_sync_invalid_context_does_not_prevent_other_batches_starting(self):
+        target = {"record_id": "target", "fields": {"报关单号": "223120260000174064",
+                  "合同号_1": "26MT-01A001", "报关品名": "钢管", "报关金额": "100", "采购金额": ""}}
+        invalid = {"record_id": "bad", "fields": {"报关单号": "223120260000174065",
+                   "合同号_1": "26MT-01A001", "报关品名": "", "报关金额": "50"}}
+        class FakeClient:
+            def iter_search_records(self, *_args):
+                yield target
+            def search_records(self, _app, _table, query):
+                return [target] if query["conditions"][0]["field_name"] == "报关单号" else [target, invalid]
+        with patch.object(feishu_workflow, "_target", return_value=(FakeClient(), "app", "table")), \
+             patch.object(workspace, "start_job", return_value="partial") as start, \
+             patch.object(workspace, "_update"):
+            result = feishu_workflow.start_scan(limit=1)
+            self.assertEqual(result["id"], "partial")
+            self.assertTrue(any("无法参与补齐" in row["reason"] for row in result["skipped"]))
+            start.assert_called_once()
+
     def test_manual_adjustment_stays_writable_and_flag_blocks_group(self):
         source = {"record_id": "rec_1", "报关单号": "223120260000174064",
                   "合同号_1": "26MT-01A001", "报关品名": "钢管", "报关金额": "100.00"}

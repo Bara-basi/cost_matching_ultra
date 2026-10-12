@@ -100,7 +100,13 @@ def _input_reason(item):
 
 
 def _item_key(item):
-    return (item["报关单号"], item["合同号_1"], item["报关品名"])
+    return (item["报关单号"], item["合同号_1"], item["报关品名"], item.get("商品序号", ""))
+
+
+def _context_tokens(contract):
+    from app.services.contract_shipments import expand_contract
+
+    return {token.upper() for token in expand_contract(contract)}
 
 
 def _merge_group_totals(items):
@@ -214,18 +220,25 @@ def select_records(*, start_date="", end_date="", declarations="", contracts="",
     context = []
     # 同合同补齐：只要本批选中的行涉及某张出运单，就把它在该出运单上的其它商品行一并拉进来。
     # 早先只在"填了日期范围"时才补，导致只按报关单号/合同号筛选时拆单池不完整、成本算不出来。
-    if any(_tokens(item["合同号_1"]) for item in selected):
+    if any(_context_tokens(item["合同号_1"]) for item in selected):
+        from app.services.shipment_detail import shipment_invoices_for_contract
+
+        contracts_needed = {token for item in selected for token in _context_tokens(item["合同号_1"])}
+        search_tokens = {token for item in selected for token in _tokens(item["合同号_1"])} | contracts_needed
+        for source in selected:
+            for invoice in shipment_invoices_for_contract(source["合同号_1"]):
+                contracts_needed.update(_context_tokens(invoice))
+                search_tokens.update(_context_tokens(invoice) | _tokens(invoice))
         matched = _search_many(client, app, table, "合同号_1",
-                               {token for item in selected for token in _tokens(item["合同号_1"])},
+                               search_tokens,
                                operator="contains")
         selected_ids = {record_id for item in selected
                         for record_id in [item["record_id"], *item.get("mergedRecordIds", [])]}
-        contracts_needed = {token for item in selected for token in _tokens(item["合同号_1"])}
         for record in matched:
             if record["record_id"] in selected_ids:
                 continue
             fields = record.get("fields") or {}
-            if not (_tokens(_text(fields.get("合同号_1"))) & contracts_needed):
+            if not (_context_tokens(_text(fields.get("合同号_1"))) & contracts_needed):
                 continue
             if _text(fields.get(META_SOURCE)):
                 continue
@@ -350,6 +363,8 @@ def plan(job_id):
             reasons.append("没有得到对应拆单结果")
         if original is None:
             reasons.append("来源行缺少拆分前报关金额")
+        if any(child.get("_未核算") for child in children):
+            reasons.append("该出运批次未核算，请补齐输入并重新核算，不能人工调整后写回")
         if any(child.get("异常类型") not in ("正常", "人工调整待写回") for child in children):
             reasons.append("组内存在待复核记录")
         amounts = [_amount(child.get("报关金额")) for child in children]

@@ -1,10 +1,10 @@
 r"""逐条核验的输入解析与补全。
 
-粘贴策略（2026-09-29 与用户对齐）：
+粘贴策略（2026-10-12）：
 1. **只落可靠字段**：报关单号（18 位）、合同号 / 采购订单号（`xxMT-…`）、海关编码（10 位）、币种；
    带标签（`报关金额：123`）的才取金额 / 重量 / 品名，**不按位置猜数字**；
-2. 其余不准的字段交给「从飞书与睿贝补全」：按报关单号 / 合同号精确查飞书；
-   稀疏行（只给了单号或合同）直接展开成该单 / 该合同的全部商品行；
+2. 其余字段只按明确指定的报关单号补全；只给合同号时要求提供完整报关行，
+   不按合同展开其它报关单，也不在核算阶段自动补齐。
 3. 飞书不可达时退回本地快照并明确提示来源，绝不静默猜值。
 """
 from __future__ import annotations
@@ -82,7 +82,7 @@ def _sum_text(*values) -> str:
 
 
 def _collapse_records(records: list[dict]) -> list[dict]:
-    """同一「报关单号 + 合同号 + 报关品名」的多行飞书记录 → 合并成一条报关行。
+    """同一「报关单号 + 合同号 + 报关品名 + 商品序号」的多行飞书记录 → 合并成一条报关行。
 
     财务会把脚本拆出的结果再手工补回多维表，于是同一张报关单在表里出现多行拆完单
     的记录（报关金额、报关重量都被拆散）。这类数据不是「一张报关单多个商品」，
@@ -90,12 +90,12 @@ def _collapse_records(records: list[dict]) -> list[dict]:
     返回的 record 是 fields 已合并的副本，并带 `_拆分行数` / `_成员金额`；
     报关单号为空时不合并，避免把不同报关单的行并到一起。
     """
-    order: list[tuple[str, str, str]] = []
-    groups: dict[tuple[str, str, str], list[dict]] = {}
+    order: list[tuple[str, ...]] = []
+    groups: dict[tuple[str, ...], list[dict]] = {}
     for record in records:
         fields = record.get("fields") or {}
         key = (_text(fields.get("报关单号")), _text(fields.get("合同号_1")),
-               _text(fields.get("报关品名")))
+               _text(fields.get("报关品名")), _text(fields.get("商品序号")))
         if key not in groups:
             groups[key] = []
             order.append(key)
@@ -197,7 +197,7 @@ def parse_paste(text: str) -> dict:
                     rows.append(row)
                     evidence.append({"来源行": "\t".join(cells)[:300]})
             return {"rows": rows, "evidence": evidence,
-                    "warnings": ["单次最多 50 行，请分批粘贴"] if len(rows) > MAX_ROWS else []}
+                    "warnings": ["单次最多 50 行；请提交完整出运批次，同批超过上限时使用模板文件"] if len(rows) > MAX_ROWS else []}
 
     # 2) 自由文本：逐行抽取；没有主键的行当作续行，并进下一行一起识别
     rows = []
@@ -241,7 +241,7 @@ def parse_paste(text: str) -> dict:
         merged.append(row)
     rows = merged
     return {"rows": rows, "evidence": evidence,
-            "warnings": ["单次最多 50 行，请分批粘贴"] if len(rows) > MAX_ROWS else []}
+            "warnings": ["单次最多 50 行；请提交完整出运批次，同批超过上限时使用模板文件"] if len(rows) > MAX_ROWS else []}
 
 
 def _snapshot() -> tuple[list[dict], str]:
@@ -342,7 +342,7 @@ def _merge(base: dict, record: dict) -> dict:
 
 
 def enrich_rows(rows: list[dict], *, sources: list[dict] | None = None) -> dict:
-    """按报关单号 / 合同号从飞书与睿贝补全；稀疏行展开成该单的全部商品行。"""
+    """仅补全用户已指定报关单的字段，不按合同增加其它报关单。"""
     from app.services.erp_cache_index import lookup as erp_lookup
 
     declarations = {str(row.get("报关单号") or "").strip() for row in rows if str(row.get("报关单号") or "").strip()}
@@ -360,10 +360,9 @@ def enrich_rows(rows: list[dict], *, sources: list[dict] | None = None) -> dict:
             if contract:
                 by_contract.setdefault(contract, []).append(record)
     else:
-        by_decl, by_contract, label, warnings = _fetch(declarations, contracts)
+        by_decl, by_contract, label, warnings = _fetch(declarations, set())
 
     output: list[dict] = []
-    seen_contracts: set[str] = set()
     for index, raw in enumerate(rows, 1):
         row = {key: str(value or "").strip() for key, value in raw.items() if key in FIELDS}
         notes: list[str] = []
@@ -384,19 +383,20 @@ def enrich_rows(rows: list[dict], *, sources: list[dict] | None = None) -> dict:
         contract = row.get("合同号_1", "")
         if contract and contract not in contracts:
             contracts.add(contract)
-            if sources is None and not declaration:
-                # 刚补出合同号时，把该合同的行也取回来
-                _, extra, _, _ = _fetch(set(), {contract})
-                by_contract.update(extra)
         sparse = not row.get("报关品名") and not row.get("报关金额")
         candidates: list[dict] = []
         if declaration:
             candidates = list(by_decl.get(declaration, []))
         elif contract:
-            candidates = list(by_contract.get(contract, []))
-            seen_contracts.add(contract)
+            warnings.append(f"第 {index} 行请提供报关单号及完整商品行；逐条核验不再按合同自动补入其它报关单")
         # 同一报关单的多行「拆完单记录」先并回一条，不要摊成多行
         candidates = _collapse_records(candidates)
+
+        if row.get("商品序号"):
+            numbered = [item for item in candidates
+                        if _text((item.get("fields") or {}).get("商品序号")) == row["商品序号"]]
+            if numbered:
+                candidates = numbered
 
         if declaration and not sparse and candidates:
             for name in ("报关品名", "报关金额"):
@@ -437,7 +437,7 @@ def enrich_rows(rows: list[dict], *, sources: list[dict] | None = None) -> dict:
             else:
                 warnings.append(f"第 {index} 行在{label}里没有找到对应商品行")
 
-        # 稀疏行（只给了报关单号或合同号）→ 展开成该单 / 该合同的全部商品行
+        # 稀疏行（已给报关单号）→ 展开成该报关单的全部商品行
         # （同一报关单的拆完单记录已先并回一条，所以这里展开的是「一张报关单一条记录」）
         if sparse and candidates:
             room = MAX_ROWS - len(output)
@@ -452,7 +452,7 @@ def enrich_rows(rows: list[dict], *, sources: list[dict] | None = None) -> dict:
                     child["_已合并"] = True
                 output.append(child)
             if len(candidates) > len(expanded):
-                warnings.append(f"第 {index} 行展开后超过 {MAX_ROWS} 行上限，请分批处理")
+                warnings.append(f"第 {index} 行展开后超过 {MAX_ROWS} 行上限，同批超过上限时请使用模板文件")
             continue
 
         row["_补全说明"] = "；".join(notes)
@@ -461,12 +461,13 @@ def enrich_rows(rows: list[dict], *, sources: list[dict] | None = None) -> dict:
     # 粘贴了同一报关单的多行拆完单记录时，只保留合并后的那一条；
     # 否则下游按「单号 + 合同 + 品名」再合并求和会把同一批金额重复计算。
     unique: list[dict] = []
-    seen_split_keys: set[tuple[str, str, str]] = set()
+    seen_split_keys: set[tuple[str, ...]] = set()
     duplicate_rows = 0
     for row in output:
         declaration = str(row.get("报关单号") or "").strip()
         key = (declaration, str(row.get("合同号_1") or "").strip(),
-               str(row.get("报关品名") or "").strip())
+               str(row.get("报关品名") or "").strip(),
+               str(row.get("商品序号") or "").strip())
         if row.pop("_已合并", False) and declaration:
             if key in seen_split_keys:
                 duplicate_rows += 1
@@ -478,7 +479,7 @@ def enrich_rows(rows: list[dict], *, sources: list[dict] | None = None) -> dict:
     output = unique
 
     if len(output) > MAX_ROWS:
-        warnings.append(f"补全后共 {len(output)} 行，超过单批上限，请分批处理")
+        warnings.append(f"补全后共 {len(output)} 行，超过单批上限，同批超过上限时请使用模板文件")
         output = output[:MAX_ROWS]
     return {"rows": output, "warnings": warnings}
 
@@ -504,79 +505,6 @@ def declarations_from_rows(rows: list[dict]) -> list[dict]:
                 "币种": str(row.get("币种") or "").strip(),
             }
         )
-    return out
-
-
-def contract_tokens(rows: list[dict]) -> set[str]:
-    """把若干行的 `合同号_1` 拆成出运单记号集合（联合号按 & , ； 拆开）。"""
-    tokens: set[str] = set()
-    for row in rows:
-        for token in re.split(r"[&,，;；\s]+", _text(row.get("合同号_1"))):
-            if token.strip():
-                tokens.add(token.strip())
-    return tokens
-
-
-def order_cores(rows: list[dict]) -> set[str]:
-    """提交行所属的**订单核心**（`26MT-06N121A` → `26MT-06N121`）。
-
-    同一条出运单常按批次/附加单拆成多张报关单，`合同号_1` 只差尾缀
-    （`…-A` / `…A` / `…-ADD1`）；只按合同号原文找兄弟报关行会漏，所以要按核心再找一遍。
-    """
-    from app.services.parser.output_columns import derive_contract
-
-    cores: set[str] = set()
-    for token in contract_tokens(rows):
-        core = derive_contract(token)
-        if core and core != token:
-            cores.add(core)
-    return cores
-
-
-def related_rows(rows: list[dict]) -> list[dict]:
-    """逐条核验补上下文：把提交行所属出运单（合同号）下的**其它报关行**也取回来。
-
-    逐条核验一次最多 50 行，而一条出运单的货常拆在多张报关单上；只拿提交的几张去
-    拆单，货池不完整就会多摊 / 少摊 / 补出多余的补充行。这里按合同号从飞书把同
-    出运单的其它报关行补成**上下文行**（只参与核算，不进结果、不写回）。
-    飞书不可达时返回空表，退回原行为。
-    """
-    contracts = contract_tokens(rows) | order_cores(rows)
-    if not contracts:
-        return []
-    try:
-        _by_decl, by_contract, _label, _warnings = _fetch(set(), contracts)
-    except Exception:  # noqa: BLE001  拿不到飞书就用原输入，绝不因此报错
-        return []
-    submitted = {(_text(row.get("报关单号")), _text(row.get("报关品名"))) for row in rows}
-    out: list[dict] = []
-    seen: set[tuple] = set()
-    for records in by_contract.values():
-        for record in _collapse_records(records):
-            fields = record.get("fields") or {}
-            declaration = _text(fields.get("报关单号"))
-            name = _text(fields.get("报关品名"))
-            if not declaration or (declaration, name) in submitted:
-                continue
-            key = (declaration, _text(fields.get("合同号_1")), name)
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(
-                {
-                    "来源文件": "逐单核验上下文",
-                    "合同号_1": _text(fields.get("合同号_1")),
-                    "报关单号": declaration,
-                    "商品序号": "",
-                    "报关品名": name,
-                    "海关编码": _text(fields.get("海关编码")),
-                    "报关重量": _amount_text(fields.get("报关重量")),
-                    "申报数量": "",
-                    "申报单位": "",
-                    "总价": _amount_text(fields.get("报关金额")),
-                    "币种": _text(fields.get("币种")),
-                }
-            )
     return out
 
 

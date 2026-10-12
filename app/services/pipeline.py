@@ -42,9 +42,8 @@ def write_declarations(rows: list[dict], path: Path) -> int:
     """把一维商品行写成「解析结果」格式的 xlsx，供拆单直接消费。
 
     写之前先把「财务手工补回的拆单结果」合并回一条报关行：
-    同一 `报关单号 + 合同号 + 报关品名` 出现多行时，说明财务把拆单结果又补回了表里
-    （一行一条拆分记录），这类行不是真的多商品报关，要把**报关金额与报关重量并回去**，
-    当成一条报关行再交给拆单（2026-09-29 用户口径；最终以系统核算结果为准）。
+    同一 `报关单号 + 合同号 + 报关品名 + 商品序号` 的历史拆分行先合并。
+    真实不同商品序号保留为独立输入；不能仅因品名相同就把真实商品并成历史拆分行。
     只作用于飞书/手工输入（PDF 解析结果不走这里），所以真的多商品报关不会被并。
     """
     merged_rows, merged_count = merge_declaration_rows(rows)
@@ -112,7 +111,8 @@ def merge_group_totals(rows: list[dict]) -> tuple[str, str]:
     seen: set[tuple] = set()
     unique: list[tuple] = []
     for row in rows:
-        amount = _dec_text(row.get("报关金额", row.get("总价")))
+        value = row.get("报关金额")
+        amount = _dec_text(row.get("总价") if value in (None, "") else value)
         weight = _dec_text(row.get("报关重量"))
         key = (amount, weight)
         if key in seen:
@@ -141,7 +141,7 @@ def merge_declaration_rows(rows: list[dict]) -> tuple[list[dict], int]:
     """
     key_of = _declaration_key
     slots: list[tuple[str, object]] = []
-    index: dict[tuple[str, str, str], list[dict]] = {}
+    index: dict[tuple[str, ...], list[dict]] = {}
     out: list[dict] = []
     merged = 0
     for row in rows:
@@ -174,13 +174,14 @@ def merge_declaration_rows(rows: list[dict]) -> tuple[list[dict], int]:
     return out, merged
 
 
-def _declaration_key(row: dict) -> tuple[str, str, str] | None:
+def _declaration_key(row: dict) -> tuple[str, str, str, str] | None:
     declaration = str(row.get("报关单号") or "").strip()
     if not declaration:
         return None
     return (declaration,
             str(row.get("合同号_1") or row.get("合同号（应收表格）") or "").strip(),
-            str(row.get("报关品名") or "").strip())
+            str(row.get("报关品名") or "").strip(),
+            str(row.get("商品序号") or "").strip())
 
 
 def parse_pdfs(pdf_paths: list[Path], out_xlsx: Path) -> dict:
@@ -234,175 +235,153 @@ def _num(value) -> "Decimal":
         return Decimal(0)
 
 
-def build_supplements(out_dir: Path, parse_xlsx: Path) -> list[dict]:
-    """用睿贝出运明细，给「没有任何报关单认领」的产品行补出补充报关行。
+def run_round(parse_xlsx: Path, out_dir: Path, only: str = "") -> dict:
+    """与离线脚本一致，只对真实报关输入拆单一次，不生成 ERP 补充报关行。"""
+    stats = run_split(parse_xlsx, out_dir, only)
+    return {"stats": stats, "supplemented": 0}
 
-    原则（2026-09-29 用户口径）：**不要求必须有报关单 PDF 才能算成本**。
-    拆单跑完后仍未认领的产品行，按「合同号 + 采购单」合并成一条补充报关行，
-    金额取这些行的出运金额合计；再把该出运单的差额（客户费用等，
-    用 ERP 的「出运总金额」比对）按金额占比摊到这些补充行上。
-    """
-    from decimal import Decimal
 
-    unclaimed_path = out_dir / "拆单_未认领产品行.xlsx"
-    if not unclaimed_path.exists():
-        return []
-    unclaimed = _read_sheet(unclaimed_path)
-    groups: dict[tuple[str, str], dict] = {}
-    for row in unclaimed:
-        contract = str(row.get("合同号_1") or "").strip()
-        purchase = str(row.get("采购单号") or "").strip()
-        amount = _num(row.get("出运金额"))
-        if not contract or not purchase or amount <= 0:
-            continue
-        key = (contract, purchase)
-        entry = groups.setdefault(key, {"amount": Decimal(0), "name": "", "rows": 0})
-        entry["amount"] += amount
-        entry["rows"] += 1
-        name = str(row.get("报关品名") or "").strip()
-        if name and not entry["name"]:
-            entry["name"] = name
-    if not groups:
-        return []
+class BatchCalculationError(ValueError):
+    """本批无法核算的业务原因；完整明细随任务状态返回界面。"""
 
-    # 该出运单已有报关行用了什么币种，补充行沿用（金额口径必须一致）
-    currency: dict[str, str] = {}
-    declared_total: dict[str, Decimal] = {}
+    def __init__(self, issues: list[dict], *, reason: str = "incomplete_input"):
+        self.issues = issues
+        self.reason = reason
+        details = "；".join(str(item["原因"])[:110] for item in issues[:2])
+        super().__init__(f"本批无法核算：{details}" + (f"；另有 {len(issues)-2} 项，请查看核验明细。" if len(issues) > 2 else ""))
+
+
+def validate_input_completeness(parse_xlsx: Path) -> None:
+    """按对应出运单核验真实输入，联合合同及共享同一出运单的写法一起比较。"""
+    from decimal import Decimal, InvalidOperation
+    from app.services.shipment_detail import load_shipment_detail, shipment_invoices_for_contract, strip_pi
+
+    # 保留已确认的「报关金额 vs 出运总金额」容差；它与采购成本对账的人民币容差不同。
+    tolerance = Decimal("5")
+
+    def amount(value):
+        try:
+            result = Decimal(str(value).replace(",", "").strip())
+            return result if result.is_finite() else None
+        except (InvalidOperation, ValueError):
+            return None
+
+    issues: list[dict] = []
+    by_contract: dict[str, dict] = {}
     for row in _read_sheet(parse_xlsx):
         contract = str(row.get("合同号_1") or "").strip()
         if not contract:
             continue
-        if str(row.get("币种") or "").strip():
-            currency.setdefault(contract, str(row["币种"]).strip())
-        declared_total[contract] = declared_total.get(contract, Decimal(0)) + _num(row.get("总价"))
-
-    # 每个出运单：ERP 出运总金额 − 已有报关行金额 − 补充行金额 = 还差的（客户费用等）
-    supplement_total: dict[str, Decimal] = {}
-    for (contract, _purchase), entry in groups.items():
-        supplement_total[contract] = supplement_total.get(contract, Decimal(0)) + entry["amount"]
-    gap: dict[str, Decimal] = {}
-    for contract in supplement_total:
-        total, _fee = _shipment_totals(contract)
-        if total <= 0:
+        entry = by_contract.setdefault(contract, {"declared": Decimal(0), "currencies": set()})
+        value = row.get("总价")
+        declared = amount(row.get("报关金额") if value in (None, "") else value)
+        if declared is None or declared <= 0:
+            issues.append({"合同号": contract, "报关单号": str(row.get("报关单号") or ""),
+                           "原因": f"{contract}：报关金额缺失或不是有效正数，本批无法核算。"})
             continue
-        gap[contract] = total - declared_total.get(contract, Decimal(0)) - supplement_total[contract]
+        entry["declared"] += declared
+        currency = str(row.get("币种") or "").strip().upper()
+        if currency:
+            entry["currencies"].add({"美元": "USD", "欧元": "EUR", "人民币": "RMB", "CNY": "RMB"}.get(currency, currency))
 
-    supplements: list[dict] = []
-    for (contract, purchase), entry in groups.items():
-        amount = entry["amount"]
-        extra = Decimal(0)
-        share = supplement_total.get(contract, Decimal(0))
-        if share > 0 and gap.get(contract):
-            extra = (gap[contract] * amount / share).quantize(Decimal("0.01"))
-        supplements.append(
-            {
-                "来源文件": "睿贝出运明细补充",
-                "合同号_1": contract,
-                "报关单号": "",
-                "商品序号": "",
-                "报关品名": entry["name"],
-                "海关编码": "",
-                "报关重量": "",
-                "申报数量": "",
-                "申报单位": "",
-                "总价": f"{amount + extra:.2f}",
-                "币种": currency.get(contract, "USD"),
-                "产品类型": "",
-            }
-        )
-    return supplements
-
-
-def append_declarations(parse_xlsx: Path, rows: list[dict]) -> int:
-    """把补充报关行追加到解析结果表（同一张 xlsx 上继续跑一轮）。"""
-    from openpyxl import load_workbook
-
-    workbook = load_workbook(parse_xlsx)
-    sheet = workbook.active
-    kept = 0
-    for row in rows:
-        sheet.append([row.get(column, "") for column in DECLARATION_COLUMNS])
-        kept += 1
-    workbook.save(parse_xlsx)
-    return kept
-
-
-def run_round(parse_xlsx: Path, out_dir: Path, only: str = "") -> dict:
-    """跑一轮拆单；若还有产品行没被任何报关单认领，就用睿贝出运明细补行后**再跑一轮**。"""
-    stats = run_split(parse_xlsx, out_dir, only)
-    supplements = build_supplements(out_dir, parse_xlsx)
-    if not supplements:
-        return {"stats": stats, "supplemented": 0}
-    append_declarations(parse_xlsx, supplements)
-    stats = run_split(parse_xlsx, out_dir, only)
-    return {"stats": stats, "supplemented": len(supplements)}
-
-
-def scan_receivable(rows: list[dict]) -> dict:
-    """出运单「客户费用」与「报关单是否齐」的本地核验（需求 3）。
-
-    基准 = 睿贝出运单的 **出运总金额**（已叠加全部客户费用，是最终参考金额）：
-    本批同一出运单记录的报关金额合计应当等于它；不等即「这批报关单不齐」。
-    若该出运单还带客户费用（罚金 / 运费 / 检验费…），说明金额分配依赖缺失的那几张
-    报关单才能确定，此时逐单核验要拒绝并提示用户补齐。
-
-    返回 {出运单/合同号: {"missing": bool, "fee": Decimal, "gap": Decimal, "fee_bad": bool}}
-    """
-    from decimal import Decimal
-
-    groups: dict[str, dict] = {}
-    for row in rows:
-        key = str(row.get("合同号_1") or row.get("合同号（应收表格）") or "").strip()
-        if not key:
+    if issues:
+        raise BatchCalculationError(issues)
+    amounts: dict[str, Decimal] = {}
+    currencies: dict[str, str] = {}
+    groups: list[dict] = []
+    for contract, entry in by_contract.items():
+        invoices = shipment_invoices_for_contract(contract) or [contract]
+        invoice_keys = set()
+        valid = True
+        for invoice in invoices:
+            key = strip_pi(invoice)
+            invoice_keys.add(key)
+            if key in amounts:
+                continue
+            payload = next((value for candidate in (invoice, key, f"PI-{key}")
+                            if (value := load_shipment_detail(candidate))), None)
+            if not payload:
+                issues.append({"合同号": contract, "出运单": invoice,
+                               "原因": f"{contract}：缺少睿贝出运明细，无法确认本批报关单是否齐全，请先同步或核对出运单。"})
+                valid = False
+                continue
+            base = payload.get("baseInfo") or {}
+            value = base.get("出运总金额")
+            if value in (None, ""):
+                products = payload.get("productList") or []
+                product_amounts = [amount(row.get("出运金额")) for row in products]
+                expense_amounts = [amount(row.get("金额")) for row in payload.get("expenseList") or []]
+                if not products or any(value is None for value in product_amounts + expense_amounts):
+                    issues.append({"合同号": contract, "出运单": invoice,
+                                   "原因": f"{contract}：睿贝出运金额不完整，无法核验本批输入。"})
+                    valid = False
+                    continue
+                value = sum(product_amounts + expense_amounts, Decimal(0))
+            parsed_amount = amount(value)
+            if parsed_amount is None:
+                issues.append({"合同号": contract, "出运单": invoice,
+                               "原因": f"{contract}：睿贝出运总金额无效，无法核验本批输入。"})
+                valid = False
+                continue
+            amounts[key] = parsed_amount
+            currency = str(base.get("币种") or "").strip().upper()
+            currencies[key] = {"美元": "USD", "欧元": "EUR", "人民币": "RMB", "CNY": "RMB"}.get(currency, currency)
+        if not valid:
             continue
-        entry = groups.setdefault(key, {"declared": Decimal(0), "usd": Decimal(0)})
-        entry["declared"] += Decimal(str(row.get("报关金额") or 0).replace(",", "") or 0)
-        entry["usd"] += Decimal(str(row.get("出运金额合计") or 0).replace(",", "") or 0)
-    if not groups:
-        return {}
+        combined = {"contracts": {contract}, "invoices": invoice_keys,
+                    "declared": entry["declared"], "currencies": set(entry["currencies"])}
+        remaining = []
+        for group in groups:
+            if group["invoices"] & combined["invoices"]:
+                combined["invoices"].update(group["invoices"])
+                combined["contracts"].update(group["contracts"])
+                combined["declared"] += group["declared"]
+                combined["currencies"].update(group["currencies"])
+            else:
+                remaining.append(group)
+        groups = remaining + [combined]
 
-    out: dict[str, dict] = {}
-    for key, entry in groups.items():
-        total, fee = _shipment_totals(key)
-        if total > 0:
-            # 以 ERP 的出运总金额为最终参考（含所有额外费用）
-            gap = entry["declared"] - total
-        else:
-            # 取不到出运总金额时退回「产品金额 + 客户费用」口径
-            gap = entry["declared"] - entry["usd"] - fee
-        # 金额容差 ±5：一张报关单金额基本不可能低于 50，±5 内视为舍入/汇率误差
-        tolerance = Decimal("5")
-        missing = abs(gap) > tolerance
-        out[key] = {
-            "missing": missing,
-            "fee": fee,
-            "gap": gap,
-            "fee_bad": missing and abs(fee) > tolerance,
-            "declared": entry["declared"],
-            "total": total,
-        }
-    return out
-
-
-def _shipment_totals(contract: str) -> tuple["Decimal", "Decimal"]:
-    """出运单 → (出运总金额, 客户费用合计)。取不到返回 (0, 0)。"""
-    from decimal import Decimal
-
-    from app.services.shipment_detail import load_shipment_detail, strip_pi
-
-    for key in (contract, strip_pi(contract), f"PI-{strip_pi(contract)}"):
-        if not key:
+    for group in groups:
+        label = " / ".join(sorted(group["contracts"]))
+        expected_currencies = {currencies[key] for key in group["invoices"] if currencies.get(key)}
+        if len(group["currencies"] | expected_currencies) > 1:
+            issues.append({"合同号": label, "原因": f"{label}：报关币种与出运币种不一致，无法直接核算本批。"})
             continue
-        payload = load_shipment_detail(key)
-        if not payload:
-            continue
-        base = payload.get("baseInfo") or {}
-        total = Decimal(str(base.get("出运总金额") or 0).replace(",", "") or 0)
-        fee = Decimal(0)
-        for item in payload.get("expenseList") or []:
-            fee += Decimal(str(item.get("金额") or 0).replace(",", "") or 0)
-        return total, fee
-    return Decimal(0), Decimal(0)
+        expected = sum((amounts[key] for key in group["invoices"]), Decimal(0))
+        gap = group["declared"] - expected
+        if abs(gap) > tolerance:
+            direction = "少" if gap < 0 else "多"
+            issues.append({"合同号": label, "报关金额": str(group["declared"]),
+                           "出运金额": str(expected), "差额": str(gap),
+                           "原因": f"{label}：报关合计 {group['declared']:.2f}，出运合计 {expected:.2f}，{direction} {abs(gap):.2f}；请提供该批完整报关商品行。"})
+    if issues:
+        raise BatchCalculationError(issues)
+
+
+def validate_split_completeness(out_dir: Path) -> None:
+    """拆单失败或真实货物未认领时拒绝整批；保留离线孪生行补记成本规则。"""
+    from app.services.review import _friendly_local_note
+
+    issues = []
+    exception_path = out_dir / "拆单_本地异常.xlsx"
+    if exception_path.exists():
+        for row in _read_sheet(exception_path):
+            contract = str(row.get("合同号_1") or "")
+            declaration = str(row.get("报关单号") or "")
+            _kind, note = _friendly_local_note(
+                str(row.get("说明") or ""), str(row.get("类型") or ""))
+            issues.append({"合同号": contract, "报关单号": declaration,
+                           "原因": f"{contract} / {declaration}：{note}"})
+    unclaimed_path = out_dir / "拆单_未认领产品行.xlsx"
+    if unclaimed_path.exists():
+        for row in _read_sheet(unclaimed_path):
+            if str(row.get("处理") or "").startswith("已按孪生行规则补记成本") or _num(row.get("出运金额")) <= 0:
+                continue
+            contract = str(row.get("合同号_1") or "")
+            issues.append({"合同号": contract, "采购单号": str(row.get("采购单号") or ""),
+                           "原因": f"{contract}：仍有出运产品行未对应到报关行，请补齐该批报关单；本次不会从睿贝生成报关行。"})
+    if issues:
+        raise BatchCalculationError(issues, reason="split_failed")
 
 
 def review_rows(split_xlsx: Path, amount_source: dict[str, str] | None = None) -> list[dict]:
