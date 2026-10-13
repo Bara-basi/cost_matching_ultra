@@ -363,8 +363,8 @@ def plan(job_id):
             reasons.append("没有得到对应拆单结果")
         if original is None:
             reasons.append("来源行缺少拆分前报关金额")
-        if any(child.get("_未核算") for child in children):
-            reasons.append("该出运批次未核算，请补齐输入并重新核算，不能人工调整后写回")
+        if any((child.get("_未核算") or child.get("_成本未核算")) for child in children):
+            reasons.append("该批次尚未完成核算，请补齐报关输入或对应入库凭证并重新核算，不能人工调整后写回")
         if any(child.get("异常类型") not in ("正常", "人工调整待写回") for child in children):
             reasons.append("组内存在待复核记录")
         amounts = [_amount(child.get("报关金额")) for child in children]

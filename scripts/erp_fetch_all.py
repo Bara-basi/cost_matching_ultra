@@ -36,24 +36,31 @@ ID_FIELDS = {
 }
 
 
-def fetch_list(session: ErpSession, spec, *, max_pages: int = 200, pause: float = 0.15) -> list[dict]:
+def fetch_list(session: ErpSession, spec, *, max_pages: int = 1000, pause: float = 0.15) -> list[dict]:
     rows: list[dict] = []
     seen: set[str] = set()
     id_field = ID_FIELDS.get(spec.name, "id")
     page = 1
+    expected_total = 0
+    fetched_count = 0
     while page <= max_pages:
         query = dict(spec.base_query)
         query[spec.page_param] = page
         payload = session.fetch_json(spec.path, query)
         from app.services.erp_replay import columns_to_rows
 
-        page_rows = columns_to_rows(payload.get("root"))
+        if "root" not in payload:
+            raise RuntimeError(f"{spec.name} 第 {page} 页未返回列表数据，未写入不完整列表")
+        expected_total = max(expected_total, int(payload.get("total") or 0))
+        page_rows = [row for row in columns_to_rows(payload.get("root"))
+                     if str(row.get(id_field) or "").strip()]
         if not page_rows:
             break
+        fetched_count += len(page_rows)
         added = 0
         for row in page_rows:
             # 主键去重；分页边界重复时才会命中
-            key = str(row.get(id_field) or json.dumps(row, ensure_ascii=False, sort_keys=True))
+            key = str(row[id_field])
             if key in seen:
                 continue
             seen.add(key)
@@ -64,12 +71,16 @@ def fetch_list(session: ErpSession, spec, *, max_pages: int = 200, pause: float 
             f"  {spec.name} page {page}: +{added}/{len(page_rows)} total={total} got={len(rows)}",
             flush=True,
         )
+        if page > 1 and added == 0:
+            raise RuntimeError(f"{spec.name} 第 {page} 页完全重复，分页没有推进")
         if total and len(rows) >= total:
             break
         if len(page_rows) < 64 and not total:
             break
         page += 1
         time.sleep(pause)
+    if (expected_total and len(rows) < expected_total) or page > max_pages:
+        raise RuntimeError(f"{spec.name} 列表未抓齐：已获取 {fetched_count} 条原始行（去重后 {len(rows)}），远端总数 {expected_total}，未写入不完整列表")
     return rows
 
 

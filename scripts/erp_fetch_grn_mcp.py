@@ -46,6 +46,8 @@ def list_is_stale(cached: dict, max_age_days: float) -> bool:
     """附件清单缓存是否过期（判断依据：抓取时间；判不出时间就当过期）。"""
     from datetime import datetime, timezone
 
+    if max_age_days <= 0:
+        return True
     stamp = str(cached.get("fetchedAt") or "").strip()
     if not stamp:
         return True
@@ -62,7 +64,36 @@ def list_is_stale(cached: dict, max_age_days: float) -> bool:
 def candidates() -> list[dict]:
     """发生过入库（有入库数量或入库日期）的采购单，按入库时间倒序。"""
     rows = read_jsonl(CACHE_ROOT / "purchases" / "purchases.jsonl")
-    wanted = [r for r in rows if num(r.get("grnQuantity")) > 0 or str(r.get("lastGrnDate") or "").strip()]
+    # 旧采购单可能在本月出运/补传附件；不能只看采购日期或入库标志。
+    from app.services.shipment_index import normalise_purchase_code
+    from app.services.contract_shipments import order_core
+    import re
+    # 先以真实采购列表为准；合写/批次别名只扩展到已存在的同核心采购单。
+    wanted = [row for row in rows if str(row.get("purchase_code") or "").strip()
+              and row.get("_remotePresent") is not False]
+    known = {normalise_purchase_code(str(row["purchase_code"])) for row in wanted}
+    by_core = {}
+    for code in known:
+        by_core.setdefault(order_core(code), set()).add(code)
+    additional = set()
+    for path in (CACHE_ROOT / "details" / "shipments").glob("*.json"):
+        try:
+            detail = json.loads(path.read_text(encoding="utf-8"))
+        except ValueError:
+            continue
+        for item in detail.get("productList") or []:
+            raw_code = str(item.get("采购订单号") or "")
+            # &ADD 是真实编号的一部分；先匹配完整编号再拆联合写法。
+            if normalise_purchase_code(raw_code.strip()) in known:
+                continue
+            for token in re.split(r"[,，、;；&]+", raw_code):
+                code = normalise_purchase_code(token.strip())
+                if not code or code in known or order_core(code) in by_core:
+                    continue
+                # 不把「麦金3吨/增补」等备注当成采购编号发给接口。
+                if re.fullmatch(r"\d{2}MT-\d{2}[A-Za-z]\d{3}[A-Za-z0-9-]*", code):
+                    additional.add(code)
+    wanted.extend({"purchase_code": code} for code in sorted(additional))
     wanted.sort(key=lambda r: str(r.get("lastGrnDate") or ""), reverse=True)
     return wanted
 
@@ -96,12 +127,15 @@ def main() -> None:
         todo = from_code + missing
     if args.limit:
         todo = todo[: args.limit]
-    print(f"发生过入库的采购单 {len(todo)} 个", flush=True)
+    print(f"待检查采购单 {len(todo)} 个", flush=True)
 
     client = McpClient(token)
     client.initialize()
     manifest = load_manifest()
     stats = {"scanned": 0, "withGrn": 0, "downloaded": 0, "skipped": 0, "errors": 0}
+    consecutive_failures = 0
+    interrupted = False
+    download_failures = 0
 
     with sync_playwright() as playwright:
         browser = launch_browser(playwright)
@@ -112,7 +146,7 @@ def main() -> None:
             if not code:
                 continue
             cached = None if args.force else load_list(code)
-            if cached is not None and args.list_max_age_days > 0 and list_is_stale(cached, args.list_max_age_days):
+            if cached is not None and list_is_stale(cached, args.list_max_age_days):
                 # 清单里的 downloadUrl 指向 tempFile，过期后服务端返回 200 + 空体
                 # （下到 0 字节文件，成本匹配就永远「缺入库单」）→ 过期清单必须重抓。
                 cached = None
@@ -123,13 +157,22 @@ def main() -> None:
                     )
                 except Exception as exc:  # noqa: BLE001
                     stats["errors"] += 1
+                    consecutive_failures += 1
+                    if consecutive_failures >= 3:
+                        interrupted = True
+                        break
                     if index % 20 == 0:
                         print(f"  [{index}/{len(todo)}] {code} 清单失败 {exc}", flush=True)
                     continue
                 value = parse_purchase_payload(text)
                 if not value:
                     stats["errors"] += 1
+                    consecutive_failures += 1
+                    if consecutive_failures >= 3:
+                        interrupted = True
+                        break
                     continue
+                consecutive_failures = 0
                 cached = {
                     "purchaseCode": code,
                     "purchaseId": (value.get("purchaseBaseInfo") or {}).get("purchaseId"),
@@ -149,7 +192,10 @@ def main() -> None:
             for item in grn_items:
                 name = item["name"]
                 target = GRN_DIR / safe_name(code) / safe_name(name, "grn.xlsx")
-                if target.exists() and target.stat().st_size > 0 and not args.force:
+                previous = next((record for record in reversed(entry["files"])
+                                 if record.get("name") == name and record.get("status") == "downloaded"), {})
+                if (target.exists() and target.stat().st_size > 0 and not args.force
+                        and previous.get("sourceUrl") == item["url"]):
                     stats["skipped"] += 1
                     continue
                 try:
@@ -157,19 +203,29 @@ def main() -> None:
                 except Exception as exc:  # noqa: BLE001
                     stats["errors"] += 1
                     entry["files"].append({"name": name, "status": "error", "error": str(exc)[:120]})
+                    download_failures += 1
+                    if download_failures >= 3:
+                        interrupted = True
+                        break
                     continue
                 if not size:
                     # 200 + 空体：下载链接已过期或会话失效，不能算成功
-                    target.unlink(missing_ok=True)
                     stats["errors"] += 1
                     entry["files"].append(
                         {"name": name, "status": "empty", "error": "空文件（下载链接可能已过期）"}
                     )
+                    download_failures += 1
+                    if download_failures >= 3:
+                        interrupted = True
+                        break
                     continue
+                download_failures = 0
                 stats["downloaded"] += 1
                 entry["files"].append(
-                    {"name": name, "status": "downloaded", "bytes": size, "path": str(target)}
+                    {"name": name, "status": "downloaded", "bytes": size, "path": str(target), "sourceUrl": item["url"]}
                 )
+            if interrupted:
+                break
             if index % 20 == 0 or index == len(todo):
                 save_manifest(manifest)
                 print(
@@ -180,12 +236,14 @@ def main() -> None:
         browser.close()
 
     save_manifest(manifest)
-    summary = {"finishedAt": now_iso(), "total": len(todo), **stats}
+    summary = {"finishedAt": now_iso(), "total": len(todo), "interrupted": interrupted, **stats}
     (CACHE_ROOT / "reports").mkdir(parents=True, exist_ok=True)
     (CACHE_ROOT / "reports" / "grn_mcp_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=1), encoding="utf-8"
     )
     print(json.dumps(summary, ensure_ascii=False))
+    if stats["errors"] or interrupted:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

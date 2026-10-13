@@ -136,7 +136,10 @@ def ensure_fresh(*, max_age_hours: float = 12.0, refresh_days: float = 7.0) -> d
     age = staleness_hours()
     if is_running():
         return {"state": "running", "message": "同步正在进行中"}
-    if age is not None and age < max_age_hours:
+    state = _read_state()
+    if state.get("interrupted"):
+        return {"state": "paused", "message": "上次同步因连续失败暂停，请确认 ERP 可用后手动恢复"}
+    if state.get("state") == "complete" and state.get("fullSyncComplete") and age is not None and age < max_age_hours:
         return {"state": "fresh", "message": f"{age:.1f} 小时前刚同步过"}
     started = start(refresh_days=refresh_days, lists_only=age is None)
     return {**started, "reason": "首次启动或数据已过期"}
@@ -166,7 +169,7 @@ def _scheduler_loop() -> None:
     while True:
         try:
             age = staleness_hours()
-            if not is_running() and (age is None or age >= INTERVAL_HOURS):
+            if not _read_state().get("interrupted") and not is_running() and (age is None or age >= INTERVAL_HOURS):
                 start(refresh_days=REFRESH_DAYS)
         except Exception:  # noqa: BLE001  调度线程不允许因为异常退出
             pass

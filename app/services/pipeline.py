@@ -288,6 +288,7 @@ def validate_input_completeness(parse_xlsx: Path) -> None:
         raise BatchCalculationError(issues)
     amounts: dict[str, Decimal] = {}
     currencies: dict[str, str] = {}
+    allowed_totals: dict[str, set[Decimal]] = {}
     groups: list[dict] = []
     for contract, entry in by_contract.items():
         invoices = shipment_invoices_for_contract(contract) or [contract]
@@ -323,6 +324,20 @@ def validate_input_completeness(parse_xlsx: Path) -> None:
                                "原因": f"{contract}：睿贝出运总金额无效，无法核验本批输入。"})
                 valid = False
                 continue
+            # 费用可含在报关金额，也可采用离线 none 口径不计入。
+            # 只允许真实产品总额 + 实际费用组合闭合，不能放过任意缺货差额。
+            allowed_totals[key] = {parsed_amount}
+            fee_amounts = [amount(row.get("金额")) for row in payload.get("expenseList") or []]
+            products = payload.get("productList") or []
+            product_amounts = [amount(row.get("出运金额")) for row in products]
+            if (products and fee_amounts and len(fee_amounts) <= 12
+                    and all(value is not None for value in product_amounts + fee_amounts)):
+                product_total = sum(product_amounts, Decimal(0))
+                # 与离线 sub / add / none 一致；最终商品指派仍由拆单引擎判断。
+                totals = {product_total}
+                for fee in fee_amounts:
+                    totals = {total + signed for total in totals for signed in (Decimal(0), fee, -fee)}
+                allowed_totals[key].update(totals)
             amounts[key] = parsed_amount
             currency = str(base.get("币种") or "").strip().upper()
             currencies[key] = {"美元": "USD", "欧元": "EUR", "人民币": "RMB", "CNY": "RMB"}.get(currency, currency)
@@ -348,6 +363,11 @@ def validate_input_completeness(parse_xlsx: Path) -> None:
             issues.append({"合同号": label, "原因": f"{label}：报关币种与出运币种不一致，无法直接核算本批。"})
             continue
         expected = sum((amounts[key] for key in group["invoices"]), Decimal(0))
+        candidates = {Decimal(0)}
+        for key in group["invoices"]:
+            candidates = {left + right for left in candidates for right in allowed_totals[key]}
+        if any(abs(group["declared"] - candidate) <= tolerance for candidate in candidates):
+            continue
         gap = group["declared"] - expected
         if abs(gap) > tolerance:
             direction = "少" if gap < 0 else "多"

@@ -76,7 +76,7 @@ class McpClient:
                         "params": {"name": name, "arguments": arguments},
                     }
                 )
-            except urllib.error.HTTPError as exc:
+            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ConnectionError) as exc:
                 if attempt < 2:
                     time.sleep(2)
                     continue
@@ -93,11 +93,20 @@ class McpClient:
         raise RuntimeError(f"{name} 重试耗尽")
 
     def call_text(self, name: str, arguments: dict) -> str:
-        result = self.call(name, arguments)
-        parts = []
-        for item in result.get("content", []) or []:
-            parts.append(item.get("text") or json.dumps(item, ensure_ascii=False))
-        return "\n".join(parts)
+        for attempt in range(3):
+            result = self.call(name, arguments)
+            parts = []
+            for item in result.get("content", []) or []:
+                if item.get("type") == "text":
+                    parts.append(str(item.get("text") or ""))
+                else:
+                    parts.append(json.dumps(item, ensure_ascii=False))
+            text = "\n".join(parts)
+            if text.strip() or attempt == 2:
+                return text
+            # 睿贝偶尔返回成功RPC但空文本；先重试，不把空content伪装成业务JSON。
+            time.sleep(2)
+        return ""
 
 
 def main() -> None:

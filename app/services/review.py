@@ -290,6 +290,8 @@ def build_rows(split_xlsx: Path, amount_source: dict[str, str] | None = None) ->
         total = dec(cost.get("total"))
         issues: list[str] = []
 
+        if str(cost.get("basis") or "").startswith("批次成本缺失"):
+            issues.append(("批次成本缺失", cost["basis"]))
         if goods <= 0:
             issues.append(("睿贝未定价", "睿贝出运单这一行没有采购金额，需要先补价。"))
         if total <= 0:
@@ -332,6 +334,7 @@ def build_rows(split_xlsx: Path, amount_source: dict[str, str] | None = None) ->
         links = erp_links(po, str(row.get("合同号_1") or ""))
         out.append(
             {
+                "_成本未核算": str(cost.get("basis") or "").startswith("批次成本缺失"),
                 "报关单号": str(row.get("报关单号") or ""),
                 "合同号_1": str(row.get("合同号_1") or ""),
                 "合同号（应收表格）": purchase_key(po),

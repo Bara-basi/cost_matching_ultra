@@ -18,7 +18,7 @@ ATTACH_ROOT = CACHE_ROOT / "attachments"
 LIST_DIR = ATTACH_ROOT / "lists"          # 每个采购单的附件清单
 GRN_DIR = ATTACH_ROOT / "grn"             # 解出的入库单文件
 MANIFEST = ATTACH_ROOT / "grn_manifest.json"
-GRN_KEYWORD = "入库单"
+GRN_KEYWORD = "入库"
 SAFE_RE = re.compile(r"[^\w\u4e00-\u9fff.\-]")
 
 
@@ -79,7 +79,15 @@ def download_file(page, url: str, destination: Path) -> int:
     if response.status != 200:
         raise RuntimeError(f"HTTP {response.status}")
     body = response.body()
-    destination.write_bytes(body)
+    if not body:
+        return 0
+    prefix = body.lstrip()[:80].lower()
+    if prefix.startswith((b"<!doctype html", b"<html")):
+        raise RuntimeError("下载返回登录页或 HTML，未覆盖原凭证")
+    # 失败/空响应不能覆盖已有有效凭证。
+    temporary = destination.with_name(destination.name + ".download")
+    temporary.write_bytes(body)
+    temporary.replace(destination)
     return len(body)
 
 

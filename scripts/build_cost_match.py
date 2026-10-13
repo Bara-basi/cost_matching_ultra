@@ -326,7 +326,7 @@ def allocate_all(split_rows: list[dict], policy: str = FEE_POLICY) -> list[dict]
             out[index] = {
                 "amount": Decimal(0) if unpriced else amount,
                 "basis": basis,
-                "blank": unpriced,
+                "blank": unpriced or amount is None,
                 "total": total,
                 "detail": detail,
                 "code": code,
@@ -587,7 +587,9 @@ def unit_reason(
     还是「两边单据本身打架」（单据冲突：与飞书、睿贝都差 10% 以上）。
     最后统一附上「我方/飞书 是不是等于睿贝出运金额」的旁证。
     """
-    if blank:
+    if blank and note.startswith("批次成本缺失"):
+        category, text = "批次成本缺失", note
+    elif blank:
         category, text = "睿贝未定价", "睿贝该行未定价（采购金额留空，待人工补价）"
     elif po_fee_info and abs(abs(mine - theirs) - abs(po_fee_info)) <= FEE_TOL:
         # 差额正好等于采购订单界面的「费用信息」：这笔费用谁算谁不算，就是这一条的分歧点

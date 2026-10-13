@@ -19,7 +19,7 @@ from app.services.erp_web import ERP_ROOT
 
 ATTACH_DIR = CACHE_ROOT / "attachments"
 MANIFEST = ATTACH_DIR / "manifest.json"
-GRN_KEYWORD = "入库单"
+GRN_KEYWORD = "入库"
 
 
 def load_manifest() -> dict:

@@ -357,7 +357,7 @@ def load_order(purchase_code: str) -> dict[str, int]:
     names = [
         str(item.get("attachmentName") or "")
         for item in payload.get("attachmentList") or []
-        if "入库单" in str(item.get("attachmentName") or "")
+        if "入库" in str(item.get("attachmentName") or "")
     ]
     return {name: index for index, name in enumerate(names)}
 
@@ -382,17 +382,23 @@ def ensure_parsed(purchase_code: str) -> None:
     不跑解析；当服务器上只剩少数几个采购单的解析缓存时，明明有入库单的单子会被
     误判成「缺入库单」。这里保证「本地有附件就先解析」，让误判不再出现。
     """
-    folder = PARSED_ROOT / safe_name(purchase_code)
-    if folder.exists() and any(folder.glob("*.json")):
-        return
     source = GRN_DIR / safe_name(purchase_code)
     if not source.is_dir():
         return
-    from app.services.grn_extract import extract_attachment
+    from app.services.grn_extract import extract_attachment, cache_path
 
     for path in sorted(entry for entry in source.iterdir() if entry.is_file()):
         if path.suffix.lower() not in (".xlsx", ".xls", ".pdf", ".jpg", ".jpeg", ".png"):
             continue
+        cached_path = cache_path(purchase_code, path.name)
+        if cached_path.exists():
+            import hashlib
+            try:
+                cached = json.loads(cached_path.read_text(encoding="utf-8"))
+                if cached.get("_digest") == hashlib.sha256(path.read_bytes()).hexdigest()[:16]:
+                    continue
+            except (ValueError, OSError):
+                pass
         try:
             extract_attachment(path, purchase_code=purchase_code, use_model=True)
         except Exception:  # noqa: BLE001 —— 单份附件解析失败不应拖垮成本匹配
@@ -429,7 +435,8 @@ def load_items(purchase_code: str) -> list[Item]:
             Item(
                 file=file_name,
                 original=original,
-                order=order_map.get(original, 10_000 + len(items)),
+                # 本地补传/远端已删除的旧附件没有真实位置，不能伪装成最新版本。
+                order=order_map.get(original, -10_000 + len(items)),
                 batch=batch_token(original),
                 is_fee=any(word in stem for word in FEE_WORDS),
                 is_version=any(word in stem for word in VERSION_WORDS),

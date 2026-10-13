@@ -16,6 +16,285 @@ from app.services import contract_shipments, feishu_workflow, lookup, pipeline, 
 
 
 class WorkbenchTests(unittest.TestCase):
+    def test_missing_grn_batch_never_allocates_other_batch_cost(self):
+        from decimal import Decimal as D
+        from app.services.cost_match import RecordCost, allocate_amounts
+        records = [RecordCost(amount_rmb=D("37960"), batch="A"),
+                   RecordCost(amount_rmb=D("506000"), batch="B")]
+        costs = allocate_amounts(records, D("38110"), {"A": D("38110")})
+        self.assertEqual(costs[0][0], D("38110"))
+        self.assertIsNone(costs[1][0])
+        self.assertIn("批次成本缺失", costs[1][1])
+        both = allocate_amounts(records, D("544110"), {"A": D("38110"), "B": D("506000")})
+        self.assertEqual([amount for amount, _ in both], [D("38110"), D("506000")])
+        only_b = allocate_amounts(records[1:], D("544110"), {"A": D("38110"), "B": D("506000")})
+        self.assertEqual(only_b[0][0], D("506000"))
+
+    def test_combined_grn_reads_blocks_instead_of_title_or_filename_batch(self):
+        from app.services.grn_extract import parse_template, blocks_to_amounts
+        from app.services.sheet_reader import read_attachment
+        from decimal import Decimal as D
+        # 合成布局反例：文件名 A、抬头 B，实际同时覆盖 A/B；不修改生产凭证。
+        source = Path(".cache/erp/attachments/grn/26MT-03T271-HD/26MT-03T271-A_鸿迪_入库单_回传_.xlsx")
+        with tempfile.TemporaryDirectory() as directory:
+            book = load_workbook(source, data_only=True)
+            sheet = book.active
+            sheet.cell(2, 1, "26MT-03T271-B入库单")
+            sheet.cell(4, 12, "实发数据-B")
+            sheet.cell(5, 12, "数量")
+            sheet.cell(5, 13, "实际金额")
+            sheet.cell(6, 12, "个")
+            sheet.cell(6, 13, "元")
+            sheet.cell(8, 12, 2)
+            sheet.cell(8, 13, 506000)
+            sheet.cell(10, 12, 2)
+            sheet.cell(10, 13, 506000)
+            path = Path(directory) / "26MT-03T271-A.xlsx"
+            book.save(path)
+            book.close()
+            parsed = parse_template(read_attachment(path))
+            self.assertTrue(parsed.ok, parsed.reason)
+            self.assertEqual(blocks_to_amounts(parsed.payload["settled_blocks"]), {"A": D("38110"), "B": D("506000")})
+            self.assertEqual(D(parsed.payload["settled_amount"]), D("544110"))
+
+    def test_existing_parsed_attachment_does_not_hide_new_batch_file(self):
+        from app.services import grn_extract, grn_select
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "grn" / "po"
+            parsed = root / "parsed" / "po"
+            source.mkdir(parents=True)
+            parsed.mkdir(parents=True)
+            (source / "A.xlsx").write_bytes(b"old")
+            (source / "B.xlsx").write_bytes(b"new")
+            (parsed / "A.xlsx.json").write_text(json.dumps({"_digest": __import__("hashlib").sha256(b"old").hexdigest()[:16]}), encoding="utf-8")
+            with patch.object(grn_select, "GRN_DIR", root / "grn"), \
+                 patch.object(grn_extract, "PARSED_ROOT", root / "parsed"), \
+                 patch.object(grn_extract, "extract_attachment") as extract:
+                grn_select.ensure_parsed("po")
+                extract.assert_called_once_with(source / "B.xlsx", purchase_code="po", use_model=True)
+                extract.reset_mock()
+                (source / "A.xlsx").write_bytes(b"updated-same-name")
+                grn_select.ensure_parsed("po")
+                extract.assert_any_call(source / "A.xlsx", purchase_code="po", use_model=True)
+
+    def test_inbound_without_dan_keeps_erp_attachment_version_order(self):
+        from app.services import grn_select
+        names = ["26MT-03T271-A 入库单.xlsx", "26MT-03T271-B 入库（回传）.xlsx"]
+        with tempfile.TemporaryDirectory() as directory, patch.object(grn_select, "LIST_DIR", Path(directory)):
+            (Path(directory) / "po.json").write_text(json.dumps({"attachmentList": [
+                {"attachmentName": name} for name in names]}), encoding="utf-8")
+            self.assertEqual(grn_select.load_order("po"), {names[0]: 0, names[1]: 1})
+
+    def test_unlisted_local_grn_cannot_outrank_current_erp_attachment(self):
+        from app.services import grn_select
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory) / "po"
+            folder.mkdir()
+            for name in ["old.xlsx", "current.xlsx"]:
+                (folder / (name + ".json")).write_text(json.dumps({"_file": name}), encoding="utf-8")
+            with patch.object(grn_select, "PARSED_ROOT", Path(directory)), \
+                 patch.object(grn_select, "ensure_parsed"), \
+                 patch.object(grn_select, "load_order", return_value={"current.xlsx": 0}), \
+                 patch.object(grn_select, "disk_to_original", return_value={}), \
+                 patch.object(grn_select, "erp_supplier", return_value=""):
+                items = grn_select.load_items("po")
+                self.assertEqual([item.file for item in items], ["old.xlsx", "current.xlsx"])
+
+    def test_unmatched_cost_batch_stays_blocked_after_manual_amount_override(self):
+        source = {"record_id": "b", "报关单号": "310120260514919201",
+                  "合同号_1": "26MT-03T271B", "报关品名": "不锈钢管件", "报关金额": "87991.48"}
+        row = {**source, "采购金额": "38110", "异常类型": "人工调整待写回",
+               "_成本未核算": True, "供应商简称": "鸿迪", "采购订单号": "26MT-03T271-HD"}
+        with tempfile.TemporaryDirectory() as directory, patch.object(workspace, "JOBS_DIR", Path(directory)):
+            job = Path(directory) / "blocked"
+            job.mkdir()
+            (job / "source_records.json").write_text(json.dumps([source]), encoding="utf-8")
+            (job / "rows.json").write_text(json.dumps([row]), encoding="utf-8")
+            group = feishu_workflow.plan("blocked")["groups"][0]
+            self.assertEqual(group["status"], "blocked")
+            self.assertTrue(any("尚未完成核算" in reason for reason in group["reasons"]))
+
+    def test_grn_attachment_names_accept_inbound_without_dan_and_empty_download_keeps_original(self):
+        from app.services.erp_attachment_mcp import grn_attachments, download_file
+        from unittest.mock import Mock
+        names = ["26MT-03T271-B_鸿迪_入库（回传） (1).xlsx", "26MT-03T271-A 入库单.xlsx", "合同.pdf"]
+        value = {"attachmentList": [{"attachmentName": name, "downloadUrl": "https://example.test/file"} for name in names]}
+        self.assertEqual([item["name"] for item in grn_attachments(value)], names[:2])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cached.xlsx"
+            path.write_bytes(b"valid-original")
+            page = Mock()
+            page.request.get.return_value.status = 200
+            page.request.get.return_value.body.return_value = b""
+            self.assertEqual(download_file(page, "https://example.test/file", path), 0)
+            self.assertEqual(path.read_bytes(), b"valid-original")
+
+    def test_sync_child_failure_not_success_and_download_skip_is_success(self):
+        from scripts import erp_sync as sync_script
+        from subprocess import CompletedProcess
+        with patch.object(sync_script.subprocess, "run", return_value=CompletedProcess([], 0, '{"errors":1}\n', '')), \
+             patch.object(sync_script, "write_state"):
+            with self.assertRaises(RuntimeError):
+                sync_script.run_script(["erp_fetch_grn_mcp.py"])
+        with patch.object(sync_script.subprocess, "run", return_value=CompletedProcess([], 0, '{"errors":0,"skipped":3}\n', '')):
+            self.assertEqual(sync_script.run_script(["erp_fetch_grn_mcp.py"])["summary"]["skipped"], 3)
+        with patch.object(sync_script.subprocess, "run", return_value=CompletedProcess([], 0, '{"rule_failed":1}\n', '')), \
+             patch.object(sync_script, "write_state"):
+            with self.assertRaises(RuntimeError):
+                sync_script.run_script(["parse_grn.py"])
+
+    def test_recent_failed_sync_never_reported_fresh(self):
+        from app.services import erp_sync
+        with patch.object(erp_sync, "is_running", return_value=False), \
+             patch.object(erp_sync, "staleness_hours", return_value=0.1), \
+             patch.object(erp_sync, "_read_state", return_value={"state": "failed"}), \
+             patch.object(erp_sync, "start", return_value={"state": "running"}) as start:
+            self.assertEqual(erp_sync.ensure_fresh()["state"], "running")
+            start.assert_called_once()
+
+    def test_zero_attachment_list_age_always_refreshes_and_three_empty_details_pause(self):
+        from scripts import erp_fetch_grn_mcp, erp_sync as sync_script
+        from unittest.mock import Mock
+        self.assertTrue(erp_fetch_grn_mcp.list_is_stale({"fetchedAt": "2999-01-01T00:00:00+08:00"}, 0))
+        client = Mock()
+        client.call_text.return_value = '{"success":true,"value":{}}'
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(sync_script, "CACHE_ROOT", Path(directory)), \
+             patch.object(sync_script, "read_jsonl", return_value=[{"invoiceCode": "missing"+str(i)} for i in range(4)]), \
+             patch.object(sync_script, "write_state"), \
+             patch("scripts.mcp_erp.McpClient", return_value=client), \
+             patch("app.services.feishu_client.get_config", return_value="test"):
+            result = sync_script.sync_shipment_details(7, 0)
+            self.assertEqual(client.call_text.call_count, 3)
+            self.assertTrue(result["interrupted"])
+            self.assertEqual(result["failed"], 3)
+
+    def test_sync_default_parses_and_lists_only_is_not_complete(self):
+        from scripts import erp_sync as sync_script
+        def run(lists_only):
+            argv = ["erp_sync.py"] + (["--lists-only"] if lists_only else [])
+            with patch("sys.argv", argv), patch.object(sync_script, "write_state") as state, \
+                 patch.object(sync_script, "sync_lists"), \
+                 patch.object(sync_script, "sync_shipment_details", return_value={"requested": 0, "done": 0, "failed": 0}), \
+                 patch.object(sync_script, "run_attachments", return_value={"returncode": 0}), \
+                 patch.object(sync_script, "run_script", return_value={"returncode": 0}) as parse, \
+                 patch("app.services.shipment_index.build", return_value={}):
+                sync_script.main()
+                finished = next(call.kwargs for call in state.call_args_list if "fullSyncComplete" in call.kwargs and "finishedAt" in call.kwargs)
+                if lists_only:
+                    self.assertEqual(finished["state"], "incomplete")
+                    self.assertFalse(finished["fullSyncComplete"])
+                    parse.assert_not_called()
+                else:
+                    self.assertEqual(finished["state"], "complete")
+                    self.assertTrue(finished["parseComplete"])
+                    self.assertEqual([Path(call.args[0][0]).name for call in parse.call_args_list], ["parse_grn.py", "select_grn.py"])
+        run(True)
+        run(False)
+
+    def test_all_purchase_lists_are_candidates_even_without_grn_flags(self):
+        from scripts import erp_fetch_grn_mcp
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(erp_fetch_grn_mcp, "CACHE_ROOT", Path(directory)), \
+             patch.object(erp_fetch_grn_mcp, "read_jsonl", return_value=[{"purchase_code": "26MT-03T271-HD", "grnQuantity": "0"}]):
+            self.assertEqual(erp_fetch_grn_mcp.candidates()[0]["purchase_code"], "26MT-03T271-HD")
+
+    def test_attachment_candidates_split_joint_codes_but_preserve_add_suffix(self):
+        from scripts import erp_fetch_grn_mcp
+        purchases = [{"purchase_code": "25MT-05Q552Y&ADD"}, {"purchase_code": "26MT-03T271-HD"}]
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(erp_fetch_grn_mcp, "CACHE_ROOT", Path(directory)), \
+             patch.object(erp_fetch_grn_mcp, "read_jsonl", return_value=purchases):
+            folder = Path(directory) / "details" / "shipments"
+            folder.mkdir(parents=True)
+            (folder / "sample.json").write_text(json.dumps({"productList": [
+                {"采购订单号": "25MT-05Q552Y&ADD"},
+                {"采购订单号": "26MT-03T271A,26MT-03T271B"},
+                {"采购订单号": "26MT-04T272-HD,26MT-04T273-HD"},
+            ]}), encoding="utf-8")
+            codes = {row["purchase_code"] for row in erp_fetch_grn_mcp.candidates()}
+            self.assertEqual(codes, {"25MT-05Q552Y&ADD", "26MT-03T271-HD", "26MT-04T272-HD", "26MT-04T273-HD"})
+
+    def test_interrupted_sync_requires_manual_resume(self):
+        from app.services import erp_sync
+        with patch.object(erp_sync, "is_running", return_value=False), \
+             patch.object(erp_sync, "staleness_hours", return_value=24), \
+             patch.object(erp_sync, "_read_state", return_value={"state": "paused", "interrupted": True}), \
+             patch.object(erp_sync, "start") as start:
+            self.assertEqual(erp_sync.ensure_fresh()["state"], "paused")
+            start.assert_not_called()
+
+    def test_list_page_missing_cannot_be_committed_as_complete(self):
+        from scripts.erp_fetch_all import fetch_list
+        from app.services.erp_lists import SHIPMENTS
+        from unittest.mock import Mock
+        session = Mock()
+        session.fetch_json.side_effect = [{"root": [], "total": 5}]
+        with self.assertRaisesRegex(RuntimeError, "未抓齐"):
+            fetch_list(session, SHIPMENTS, pause=0)
+        session.fetch_json.side_effect = [{"error": "session expired"}]
+        with self.assertRaisesRegex(RuntimeError, "未返回列表"):
+            fetch_list(session, SHIPMENTS, pause=0)
+        session.fetch_json.side_effect = [{"root": [], "total": 0}]
+        self.assertEqual(fetch_list(session, SHIPMENTS, pause=0), [])
+
+    def test_list_boundary_duplicates_are_deduped_without_false_missing_pages(self):
+        from scripts.erp_fetch_all import fetch_list
+        from app.services.erp_lists import SALE_ORDERS
+        from unittest.mock import Mock
+        session = Mock()
+        session.fetch_json.return_value = {"root": "test", "total": 3}
+        with patch("app.services.erp_replay.columns_to_rows", side_effect=[
+                [{"orderId": "1"}, {"orderId": "2"}],
+                [{"orderId": "2"}, {"orderId": "3"}]]):
+            self.assertEqual([row["orderId"] for row in fetch_list(session, SALE_ORDERS, pause=0)], ["1", "2", "3"])
+
+    def test_list_totals_row_does_not_end_pagination_early(self):
+        from scripts.erp_fetch_all import fetch_list
+        from app.services.erp_lists import PURCHASES
+        from unittest.mock import Mock
+        session = Mock()
+        session.fetch_json.return_value = {"root": "test", "total": 3}
+        with patch("app.services.erp_replay.columns_to_rows", side_effect=[
+                [{"purchase_id": "1"}, {"purchase_id": "2"}, {"purchase_id": "", "purchase_code": "合计"}],
+                [{"purchase_id": "3"}, {"purchase_id": "", "purchase_code": "合计"}]]):
+            self.assertEqual([row["purchase_id"] for row in fetch_list(session, PURCHASES, pause=0)], ["1", "2", "3"])
+            self.assertEqual(session.fetch_json.call_count, 2)
+
+    def test_new_account_projected_list_preserves_old_relation_fields(self):
+        from scripts.erp_sync import merge_rows
+        merged, added, updated = merge_rows(
+            [{"purchase_id": "2465", "orderCode": "PI-26MT-03T271", "amount": "1", "remark": "old"}],
+            [{"purchase_id": "2465", "amount": "544110", "remark": ""}], "purchase_id")
+        self.assertEqual(merged[0]["orderCode"], "PI-26MT-03T271")
+        self.assertEqual(merged[0]["amount"], "544110")
+        self.assertEqual(merged[0]["remark"], "")
+        self.assertEqual((added, updated), (0, 1))
+
+    def test_mcp_connection_reset_retries_without_losing_result(self):
+        from scripts.mcp_erp import McpClient
+        client = McpClient("test")
+        with patch.object(client, "_post", side_effect=[urllib.error.URLError("connection reset"),
+                {"result": {"content": [{"type": "text", "text": "ok"}]}}]) as request, \
+             patch("scripts.mcp_erp.time.sleep"):
+            self.assertEqual(client.call_text("shipment.find", {"invoiceCode": "test"}), "ok")
+            self.assertEqual(request.call_count, 2)
+
+    def test_mcp_empty_text_is_retried_and_never_faked_as_business_json(self):
+        from scripts.mcp_erp import McpClient
+        client = McpClient("test")
+        empty = {"content": [{"type": "text", "text": ""}]}
+        valid = {"content": [{"type": "text", "text": '{"success":true,"value":{"id":"1"}}'}]}
+        with patch.object(client, "call", side_effect=[empty, valid]) as request, \
+             patch("scripts.mcp_erp.time.sleep"):
+            self.assertTrue(json.loads(client.call_text("purchase.find", {}))["success"])
+            self.assertEqual(request.call_count, 2)
+        with patch.object(client, "call", return_value=empty) as request, \
+             patch("scripts.mcp_erp.time.sleep"):
+            self.assertEqual(client.call_text("purchase.find", {}), "")
+            self.assertEqual(request.call_count, 3)
+
     def test_lookup_incomplete_input_rejects_before_split_without_fetching_context(self):
         rows = [{"报关单号": "223120260000174064", "合同号_1": "26MT-01A001",
                  "报关品名": "钢管", "总价": "100", "币种": "USD"}]
@@ -91,6 +370,34 @@ class WorkbenchTests(unittest.TestCase):
                 with self.assertRaises(pipeline.BatchCalculationError):
                     pipeline.validate_input_completeness(path)
                 pipeline.write_declarations([row], path)
+
+    def test_customer_fee_can_be_included_or_omitted_but_currency_still_checked(self):
+        row = {"报关单号": "310120260514919201", "合同号_1": "26MT-03T271B",
+               "报关品名": "不锈钢管件", "总价": "87991.48", "币种": "USD"}
+        detail = {"baseInfo": {"出运总金额": "89991.48", "币种": "USD"},
+                  "productList": [{"出运金额": "87991.48"}],
+                  "expenseList": [{"金额": "2000", "费用备注": "3.2检验费"}]}
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(shipment_detail, "shipment_invoices_for_contract", return_value=["PI-26MT-03T271B"]), \
+             patch.object(shipment_detail, "load_shipment_detail", return_value=detail):
+            path = Path(directory) / "input.xlsx"
+            for total in ["87991.48", "89991.48"]:
+                pipeline.write_declarations([{**row, "总价": total}], path)
+                pipeline.validate_input_completeness(path)
+            pipeline.write_declarations([{**row, "总价": "43995.74"}], path)
+            with self.assertRaises(pipeline.BatchCalculationError):
+                pipeline.validate_input_completeness(path)
+            # 多笔费用允许只包含其中一笔，不能只支持全含或全不含。
+            detail["expenseList"].append({"金额": "300"})
+            pipeline.write_declarations([{**row, "总价": "88291.48"}], path)
+            pipeline.validate_input_completeness(path)
+            pipeline.write_declarations([{**row, "币种": "EUR"}], path)
+            with self.assertRaisesRegex(pipeline.BatchCalculationError, "币种"):
+                pipeline.validate_input_completeness(path)
+            pipeline.write_declarations([row], path)
+            detail["expenseList"] = []
+            with self.assertRaisesRegex(pipeline.BatchCalculationError, "少 2000.00"):
+                pipeline.validate_input_completeness(path)
 
     def test_run_round_preserves_input_and_never_builds_erp_declarations(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -668,7 +668,7 @@ def allocate_amounts(
     unattributed_fee: Decimal = Decimal(0),
     fee_target: int | None = None,
     fee_note: str = "",
-) -> list[tuple[Decimal, str]]:
+) -> list[tuple[Decimal | None, str]]:
     """把一张采购单的入库单实发总额摊到它的各条拆单记录上。
 
     `total` = 该采购单的实发合计；返回 `[(金额, 分摊依据)]`，与 `records` 一一对应。
@@ -680,6 +680,25 @@ def allocate_amounts(
     """
     if not records:
         return []
+    missing = [i for i, record in enumerate(records)
+               if batch_amounts and record.batch and record.batch not in batch_amounts]
+    if missing:
+        # 凭证明确只有 A 时，不能把 A 的总成本按比例填进 B。
+        available = "、".join(sorted(batch_amounts))
+        output = [(None, f"批次成本缺失：出运批次 {record.batch}，可用入库区块仅 {available}；请补齐对应批次入库单")
+                  for record in records]
+        positions = [i for i in range(len(records)) if i not in missing]
+        if positions:
+            values = allocate_amounts(
+                [records[i] for i in positions], total, batch_amounts, rmb_by_kind,
+                po_usd_total, po_rmb_total,
+                unattributed_fee=unattributed_fee,
+                fee_target=positions.index(fee_target) if fee_target in positions else None,
+                fee_note=fee_note,
+            )
+            for i, value in zip(positions, values):
+                output[i] = value
+        return output
     direct = _by_batch_blocks(records, total, batch_amounts or {})
     if direct is not None:
         # 区块自带批次归属，费用已经在区块金额里，不再单独归位
