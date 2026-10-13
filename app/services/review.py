@@ -15,6 +15,7 @@ import json
 import math
 import re
 from decimal import Decimal
+from functools import lru_cache
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -199,68 +200,69 @@ def _shipment_fee_total(contract: str) -> Decimal | None:
     return None
 
 
-_ERP_INDEX: dict | None = None
+def erp_sources(purchase_code: str, contract: str) -> dict:
+    """与核算共用合同→出运单解析；跳转 ID 只取网页列表的数字主键。"""
+    from app.services.erp_cache import CACHE_ROOT
+    paths = (CACHE_ROOT / "purchases/purchases.jsonl", CACHE_ROOT / "shipments/shipments.jsonl")
+    signature = tuple(path.stat().st_mtime_ns if path.exists() else 0 for path in paths)
+    return _erp_sources_cached(str(purchase_code or "").strip(), str(contract or "").strip(), signature)
 
 
-def _erp_index() -> dict:
-    """睿贝单号 → 关联单据索引（只读一次，避免逐行读盘）。"""
-    global _ERP_INDEX
-    if _ERP_INDEX is None:
-        from app.services.erp_cache_index import load_index
+@lru_cache(maxsize=1)
+def _erp_source_lists(signature: tuple) -> tuple[dict, dict]:
+    from app.services.erp_cache import CACHE_ROOT, read_jsonl
+    from app.services.shipment_detail import strip_pi
+    purchases, shipments = {}, {}
+    for kind, path, code_key, id_key in [
+        (purchases, "purchases/purchases.jsonl", "purchase_code", "purchase_id"),
+        (shipments, "shipments/shipments.jsonl", "invoiceCode", "shipmentId"),
+    ]:
+        for row in read_jsonl(CACHE_ROOT / path):
+            if row.get("_remotePresent") is False:
+                continue
+            if re.fullmatch(r"[0-9]+", str(row.get(id_key) or "")):
+                kind[strip_pi(row.get(code_key))] = row
+    return purchases, shipments
 
-        try:
-            _ERP_INDEX = load_index()
-        except Exception:  # noqa: BLE001
-            _ERP_INDEX = {}
-    return _ERP_INDEX
 
-
-def _contract_tokens(value: str) -> list[str]:
-    return [token.strip() for token in re.split(r"[,&;，、/]", str(value or "")) if token.strip()]
+@lru_cache(maxsize=2048)
+def _erp_sources_cached(purchase_code: str, contract: str, signature: tuple) -> dict:
+    from urllib.parse import urlencode
+    from app.services.erp_web import ERP_ROOT
+    from app.services.shipment_detail import shipment_invoices_for_contract, strip_pi
+    purchases, shipments = _erp_source_lists(signature)
+    purchase = purchases.get(strip_pi(purchase_code)) if purchase_code else None
+    invoices = shipment_invoices_for_contract(contract) if contract else []
+    # 精确同名也可直接定位，不需要合同拆分映射猜测。
+    if not invoices and contract and strip_pi(contract) in shipments:
+        invoices = [shipments[strip_pi(contract)]["invoiceCode"]]
+    selected = []
+    seen = set()
+    for invoice in invoices:
+        item = shipments.get(strip_pi(invoice))
+        if item and item["shipmentId"] not in seen:
+            selected.append(item)
+            seen.add(item["shipmentId"])
+    def link(kind, ident):
+        return f"{ERP_ROOT}/{kind}_toUpdate?" + urlencode({"openWindow": "Y", "type": "view", "id": ident, "openhash": "costReview"})
+    return {"purchase": {"purchases": [purchase] if purchase else []},
+            "shipment": {"shipments": selected},
+            "purchaseUrl": link("purchase", purchase["purchase_id"]) if purchase else "",
+            "shipmentLinks": [{"invoiceCode": item["invoiceCode"], "url": link("shipment", item["shipmentId"])} for item in selected]}
 
 
 def erp_links(purchase_code: str, contract: str) -> tuple[str, str]:
-    """睿贝深链接：能定位到具体单据就直开单据，否则退回对应列表页。
+    sources = erp_sources(purchase_code, contract)
+    links = sources["shipmentLinks"]
+    return sources["purchaseUrl"], links[0]["url"] if len(links) == 1 else ""
 
-    直开格式（与历史工作台一致，需要 ERP 内部数字 ID）：
-      采购单 `…/purchase_toUpdate?openWindow=Y&type=view&id=<purchase_id>&openhash=costReview`
-      出运单 `…/shipment_toUpdate?openWindow=Y&type=view&id=<shipmentId>&openhash=costReview`
-    """
-    from app.services.erp_web import ERP_ROOT
 
-    index = _erp_index()
-    purchase_link = f"{ERP_ROOT}/purchase_goOutList?menuCode=80400"
-    shipment_link = f"{ERP_ROOT}/saleOrder?menuCode=80300"
-
-    node = index.get(str(purchase_code or "").strip(), {})
-    purchases = node.get("purchases") or []
-    if purchases:
-        purchase_id = str(purchases[0].get("purchase_id") or "").strip()
-        if purchase_id:
-            purchase_link = (
-                f"{ERP_ROOT}/purchase_toUpdate?openWindow=Y&type=view"
-                f"&id={purchase_id}&openhash=costReview"
-            )
-
-    # 出运单：合同号常是联合号（`25MT-07F379Y-F&477G`），索引里按段存，逐段试
-    wanted = str(contract or "").strip().upper()
-    best: dict | None = None
-    for token in _contract_tokens(contract):
-        for ship in (index.get(token, {}).get("shipments") or []):
-            if not str(ship.get("shipmentId") or "").strip():
-                continue
-            if str(ship.get("invoiceCode") or "").strip().upper() == wanted:
-                best = ship
-                break
-            best = best or ship
-        if best and str(best.get("invoiceCode") or "").strip().upper() == wanted:
-            break
-    if best:
-        shipment_link = (
-            f"{ERP_ROOT}/shipment_toUpdate?openWindow=Y&type=view"
-            f"&id={best['shipmentId']}&openhash=costReview"
-        )
-    return purchase_link, shipment_link
+def refresh_source_links(row: dict) -> dict:
+    sources = erp_sources(row.get("采购订单号", ""), row.get("合同号_1", ""))
+    links = sources["shipmentLinks"]
+    return {**row, "_睿贝采购单链接": sources["purchaseUrl"],
+            "_睿贝出运单链接": links[0]["url"] if len(links) == 1 else "",
+            "_睿贝出运单来源": links}
 
 
 def build_rows(split_xlsx: Path, amount_source: dict[str, str] | None = None) -> list[dict]:

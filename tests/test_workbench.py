@@ -16,6 +16,57 @@ from app.services import contract_shipments, feishu_workflow, lookup, pipeline, 
 
 
 class WorkbenchTests(unittest.TestCase):
+    def test_source_links_and_evidence_resolve_same_actual_shipment(self):
+        from app.services import erp_cache
+        from app.services.erp_cache import write_jsonl
+        import app.main as main
+        row = {"合同号_1": "25MT-05G485", "采购订单号": "25MT-05G485-HD",
+               "采购金额": "123", "_睿贝出运单链接": "https://erp.mtholdinggroup.com/saleOrder?menuCode=80300"}
+        with tempfile.TemporaryDirectory() as directory, patch.object(erp_cache, "CACHE_ROOT", Path(directory)), \
+             patch.object(workspace, "result_rows", return_value=[row]), \
+             patch("app.services.shipment_detail.shipment_invoices_for_contract", return_value=["PI-25MT-05G485"]), \
+             patch.object(main, "_require_evidence_token"):
+            write_jsonl(Path(directory) / "purchases/purchases.jsonl", [{"purchase_code": "25MT-05G485-HD", "purchase_id": "200"}])
+            write_jsonl(Path(directory) / "shipments/shipments.jsonl", [{"invoiceCode": "PI-25MT-05G485", "shipmentId": "953"}])
+            review._erp_sources_cached.cache_clear()
+            review._erp_source_lists.cache_clear()
+            client = TestClient(app)
+            shown = client.get("/api/jobs/old/rows").json()["rows"][0]
+            evidence = client.get("/api/jobs/old/erp-evidence/0").json()
+            self.assertIn("id=953", shown["_睿贝出运单链接"])
+            self.assertIn("id=200", shown["_睿贝采购单链接"])
+            self.assertEqual(shown["采购金额"], "123")
+            self.assertEqual(evidence["shipment"]["shipments"][0]["shipmentId"], "953")
+
+    def test_missing_retired_or_mcp_ids_never_make_placeholder_source_links(self):
+        from app.services import erp_cache
+        from app.services.erp_cache import write_jsonl
+        with tempfile.TemporaryDirectory() as directory, patch.object(erp_cache, "CACHE_ROOT", Path(directory)), \
+             patch("app.services.shipment_detail.shipment_invoices_for_contract", return_value=[]):
+            write_jsonl(Path(directory) / "purchases/purchases.jsonl", [
+                {"purchase_code": "retired", "purchase_id": "2", "_remotePresent": False},
+                {"purchase_code": "mcp", "purchase_id": "encrypted-id"}])
+            review._erp_sources_cached.cache_clear()
+            review._erp_source_lists.cache_clear()
+            for purchase in ["", "missing", "retired", "mcp"]:
+                sources = review.erp_sources(purchase, "missing")
+                self.assertEqual(sources["purchaseUrl"], "")
+                self.assertEqual(sources["shipmentLinks"], [])
+
+    def test_multiple_actual_shipments_keep_all_detail_links(self):
+        from app.services import erp_cache
+        from app.services.erp_cache import write_jsonl
+        with tempfile.TemporaryDirectory() as directory, patch.object(erp_cache, "CACHE_ROOT", Path(directory)), \
+             patch("app.services.shipment_detail.shipment_invoices_for_contract", return_value=["PI-A", "PI-B"]):
+            write_jsonl(Path(directory) / "shipments/shipments.jsonl", [
+                {"invoiceCode": "PI-A", "shipmentId": "1"}, {"invoiceCode": "PI-B", "shipmentId": "2"}])
+            review._erp_sources_cached.cache_clear()
+            review._erp_source_lists.cache_clear()
+            # 即使合同号与一张发票同名，也不能覆盖核算解析出的完整多单集合。
+            shown = review.refresh_source_links({"合同号_1": "A"})
+            self.assertEqual(len(shown["_睿贝出运单来源"]), 2)
+            self.assertEqual(shown["_睿贝出运单链接"], "")
+
     def test_missing_grn_batch_never_allocates_other_batch_cost(self):
         from decimal import Decimal as D
         from app.services.cost_match import RecordCost, allocate_amounts

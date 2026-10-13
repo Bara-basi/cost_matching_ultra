@@ -19,7 +19,7 @@ from pydantic import BaseModel
 from app.services import erp_sync, lookup, workspace
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-APP_VERSION = "2026.10.12-api.5"
+APP_VERSION = "2026.10.13-api.1"
 
 app = FastAPI(title="成本匹配工作台", version=APP_VERSION)
 WEB_DIST = PROJECT_ROOT / "web" / "dist"
@@ -277,7 +277,8 @@ def job_rows(job_id: str) -> dict:
     rows = workspace.result_rows(job_id)
     if rows is None:
         raise HTTPException(status_code=404, detail="结果尚未生成")
-    return {"rows": rows}
+    from app.services.review import refresh_source_links
+    return {"rows": [refresh_source_links(row) for row in rows]}
 
 
 @app.get("/api/exceptions")
@@ -359,12 +360,10 @@ def job_erp_evidence(job_id: str, index: int, request: Request,
     rows = workspace.result_rows(job_id)
     if rows is None or not 0 <= index < len(rows):
         raise HTTPException(status_code=404, detail="结果记录不存在")
-    from app.services.erp_cache_index import lookup
+    from app.services.review import erp_sources
     row = rows[index]
-    purchase = str(row.get("采购订单号") or "")
-    shipment = str(row.get("合同号_1") or "")
-    return {"purchase": lookup(purchase) if purchase else {},
-            "shipment": lookup(shipment) if shipment else {}}
+    sources = erp_sources(row.get("采购订单号", ""), row.get("合同号_1", ""))
+    return {"purchase": sources["purchase"], "shipment": sources["shipment"]}
 
 
 @app.get("/api/jobs/{job_id}/evidence")

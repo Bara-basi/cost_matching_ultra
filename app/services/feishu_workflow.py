@@ -386,7 +386,9 @@ def plan(job_id):
                 reasons.append("历史拆分行无法全部按报关单号、合同号、供应商和品名对应，已暂停写回")
         numbered = [{**child, "splitKey": _row_key(source_id, child, ordinal)}
                     for ordinal, child in enumerate(children)]
-        output.append({"sourceId": source_id, "declaration": source["报关单号"],
+        output.append({"sourceId": source_id,
+                       "sourceRecordIds": list(dict.fromkeys([source_id, *source.get("mergedRecordIds", [])])),
+                       "declaration": source["报关单号"],
                        "contract": source.get("合同号_1", ""),
                        "sourceProduct": source.get("报关品名", ""),
                        "memberCount": len(source.get("sourceMembers", [source])),
