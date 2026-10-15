@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -133,11 +134,8 @@ class ErpSession:
             if self._playwright:
                 self._playwright.stop()
 
-    def fetch_json(self, path: str, query: dict[str, Any], *, method: str = "POST") -> dict[str, Any]:
-        """在页面上下文里调用接口，带上浏览器的 Cookie 与请求头。"""
-        assert self.page is not None
-        body = "&".join(f"{key}={value}" for key, value in query.items())
-        script = """
+    # 被顶号 / 会话失效时睿贝会返回登录页或空响应，而不是 JSON 列表。
+    _FETCH_SCRIPT = """
         async ([path, body, method]) => {
           const options = {method: method, headers: {"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8", "X-Requested-With": "XMLHttpRequest"}};
           if (method !== "GET") { options.body = body; }
@@ -147,10 +145,56 @@ class ErpSession:
           return {status: response.status, text: text};
         }
         """
-        result = self.page.evaluate(script, [path, body, method])
-        text = result.get("text") or ""
-        payload = parse_lenient_json(text)
-        return payload if isinstance(payload, dict) else {"root": payload}
+
+    def relogin(self) -> None:
+        """重新登录（睿贝一个账号只允许一处登录，别处登录会把这里顶掉）。
+
+        会话被顶掉后接口会返回登录页 / 空响应，列表分页随即中断。先清掉本上下文的
+        Cookie（否则 `login()` 会因为"看起来已登录"直接返回），再走一遍登录页。
+        """
+        assert self.page is not None
+        try:
+            self.page.context.clear_cookies()
+        except Exception:  # noqa: BLE001  清 Cookie 失败也要继续尝试登录
+            pass
+        login(self.page)
+
+    @staticmethod
+    def _logged_out(result: dict[str, Any], payload: dict[str, Any]) -> bool:
+        """响应是不是"没登进去"：登录页 HTML / 空响应 / 401/403 / 没有列表结构。"""
+        if int(result.get("status") or 200) in (401, 403):
+            return True
+        root = payload.get("root")
+        # 正常的列表响应一定有 root（哪怕是空列表 []）
+        if isinstance(root, list):
+            return False
+        text = str(result.get("text") or "")
+        stripped = text.lstrip()
+        if not stripped:
+            return True
+        head = stripped[:200].lower()
+        return head.startswith("<!doctype html") or head.startswith("<html") or "login" in head
+
+    def fetch_json(self, path: str, query: dict[str, Any], *, method: str = "POST",
+                   attempts: int = 3, retry_wait: float = 3.0) -> dict[str, Any]:
+        """在页面上下文里调用接口，带上浏览器的 Cookie 与请求头。
+
+        检测到会话被顶掉时自动重新登录并重试（默认最多 3 次），避免偶发空页把
+        整轮抓取判成失败。
+        """
+        assert self.page is not None
+        body = "&".join(f"{key}={value}" for key, value in query.items())
+        payload: dict[str, Any] = {}
+        for attempt in range(1, attempts + 1):
+            result = self.page.evaluate(self._FETCH_SCRIPT, [path, body, method])
+            parsed = parse_lenient_json(result.get("text") or "")
+            payload = parsed if isinstance(parsed, dict) else {"root": parsed}
+            if not self._logged_out(result, payload):
+                return payload
+            if attempt < attempts:
+                time.sleep(retry_wait)
+                self.relogin()
+        return payload
 
     def iter_list(
         self,

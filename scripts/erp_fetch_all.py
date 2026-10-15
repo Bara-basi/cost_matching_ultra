@@ -54,6 +54,22 @@ def fetch_list(session: ErpSession, spec, *, max_pages: int = 1000, pause: float
         expected_total = max(expected_total, int(payload.get("total") or 0))
         page_rows = [row for row in columns_to_rows(payload.get("root"))
                      if str(row.get(id_field) or "").strip()]
+        if not page_rows and expected_total and len(rows) < expected_total and page > 1:
+            # 空页、但远端说还有数据：大概率是会话被顶掉（睿贝一个账号只允许一处登录）。
+            # 重新登录后把这一页再要一遍，仍然拿不到才当作翻页结束（交给完整性校验兜底）。
+            for _ in range(2):
+                try:
+                    session.relogin()
+                except Exception:  # noqa: BLE001  重登失败也走完整性校验，报清楚原因
+                    break
+                time.sleep(pause)
+                payload = session.fetch_json(spec.path, query)
+                expected_total = max(expected_total, int(payload.get("total") or 0))
+                page_rows = [row for row in columns_to_rows(payload.get("root"))
+                             if str(row.get(id_field) or "").strip()]
+                if page_rows:
+                    print(f"  {spec.name} page {page}: 会话被顶掉，重新登录后取回 {len(page_rows)} 行", flush=True)
+                    break
         if not page_rows:
             break
         fetched_count += len(page_rows)

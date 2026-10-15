@@ -17,6 +17,14 @@ sys.path.insert(0, str(PROJECT_ROOT))
 URL = "https://erp.mtholdinggroup.com/AgentServerSimple/mcp"
 
 
+class SessionLost(RuntimeError):
+    """MCP 会话失效：返回登录页/HTML/空数据而不是 JSON-RPC 结果。
+
+    睿贝一个账号只允许一处登录，别处登录会把这里的会话顶掉，接口随即返回登录页。
+    这种响应要重新 `initialize()` 再重试，而不是当成业务错误直接失败。
+    """
+
+
 class McpClient:
     def __init__(self, token: str, url: str = URL) -> None:
         self.token = token
@@ -37,12 +45,40 @@ class McpClient:
         with urllib.request.urlopen(request, timeout=120) as response:
             text = response.read().decode("utf-8", "replace")
             self.session = response.headers.get("Mcp-Session-Id") or self.session
-        if notify or not text.strip():
+        if notify:
+            return None
+        return self._parse(text)
+
+    @staticmethod
+    def _parse(text: str):
+        """解析 JSON-RPC 响应：SSE 的 `data:` 行与裸 JSON 都支持。
+
+        非 JSON（登录页 HTML、被截断的响应）抛 `SessionLost`，由 `call()` 重登重试。
+        """
+        if not text.strip():
             return None
         for line in text.splitlines():
-            if line.startswith("data:"):
-                return json.loads(line[5:].strip())
-        return json.loads(text)
+            if not line.startswith("data:"):
+                continue
+            chunk = line[5:].strip()
+            if not chunk:
+                continue
+            try:
+                return json.loads(chunk)
+            except ValueError as exc:
+                raise SessionLost(f"MCP 返回非 JSON 数据：{chunk.lstrip()[:80]!r}") from exc
+        try:
+            return json.loads(text)
+        except ValueError as exc:
+            raise SessionLost(f"MCP 返回非 JSON 响应：{text.lstrip()[:80]!r}") from exc
+
+    def _reinitialize(self) -> None:
+        """丢掉旧会话重新握手（失败不抛，交给调用方按原错误处理）。"""
+        self.session = None
+        try:
+            self.initialize()
+        except Exception:  # noqa: BLE001  重连失败时让上层重试/兜底
+            pass
 
     def initialize(self) -> None:
         self._post(
@@ -77,6 +113,13 @@ class McpClient:
                     }
                 )
             except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+                if attempt < 2:
+                    time.sleep(2)
+                    continue
+                raise
+            except SessionLost:
+                # 会话被顶掉（返回登录页）：重新握手后重试同一调用。
+                self._reinitialize()
                 if attempt < 2:
                     time.sleep(2)
                     continue

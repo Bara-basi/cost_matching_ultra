@@ -63,7 +63,10 @@ def login(page) -> None:
     else:
         page.locator("button[type=submit],input[type=submit]").first.click()
     page.wait_for_load_state("domcontentloaded", timeout=60_000)
-    page.locator("input[type=password]").wait_for(state="hidden", timeout=30_000)
+    # 登录页同时带着「修改密码」弹窗的两个隐藏密码框（#diy_password / #diy_passwordConfirm），
+    # `input[type=password]` 会命中 3 个元素，Playwright 严格模式直接抛错；
+    # 这里只等登录框 #password 消失（取 .first 同样是为了避开严格模式）。
+    page.locator("#password").first.wait_for(state="hidden", timeout=30_000)
 
 
 def capture_xhr(
