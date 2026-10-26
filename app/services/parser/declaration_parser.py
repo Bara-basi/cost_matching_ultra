@@ -136,14 +136,26 @@ def _contract_after(lines: list[str]) -> str:
     index = next((i for i, line in enumerate(lines) if line.startswith("合同协议号")), None)
     if index is None:
         return ""
-    for offset in range(1, 4):
+    for offset in range(1, 6):
         if index + offset >= len(lines):
             break
         candidate = lines[index + offset].strip()
         if not candidate or _is_label(candidate):
             continue
-        if CONTRACT_TOKEN_RE.match(candidate.strip(":：")):
-            return candidate
+        candidate = candidate.strip(":：")
+        # 部分版式把 `26MT-` 和后面的订单段分到两行。
+        if re.fullmatch(r"\d{2}[A-Z]{2}-", candidate):
+            for tail_offset in range(offset + 1, 6):
+                if index + tail_offset >= len(lines):
+                    break
+                tail = lines[index + tail_offset].strip()
+                if not tail or _is_label(tail):
+                    continue
+                candidate += tail
+                break
+        match = CONTRACT_TOKEN_RE.search(candidate)
+        if match:
+            return match.group(0)
     return _value_after(lines, "合同协议号")
 
 
@@ -171,16 +183,21 @@ def recover_contract(header: DeclarationHeader, lines: list[str]) -> Declaration
         if match:
             candidate = match.group(1).strip()
             # 备注里可能只写「剩下半段」（如 `262Y-A`），因此放宽校验
-            if CONTRACT_TOKEN_RE.search(candidate) or _order_tokens(candidate):
+            token_match = CONTRACT_TOKEN_RE.search(candidate)
+            if token_match:
+                remark = token_match.group(0)
+                break
+            if _order_tokens(candidate):
                 remark = candidate
                 break
     header.contract_remark = remark
 
-    if remark:
+    raw = header.contract_raw.strip()
+    incomplete = not raw or raw.endswith("&") or not re.search(r"[A-Za-z]\d*$", raw)
+    if remark and incomplete:
         header.contract_raw = _merge_contract(header.contract_raw, remark)
         return header
 
-    raw = header.contract_raw.strip()
     if not raw:
         return header
     # 表头行位置：取标签后的那一行
