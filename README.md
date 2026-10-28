@@ -106,6 +106,15 @@ WORKBENCH_EVIDENCE_TOKEN=  # 可选：允许通过可信网关查看睿贝缓存
 
 # 可选：AI 兜底（解析/核对）
 DEEPSEEK_API_KEY=
+
+# 可选：飞书报关任务代理（启用新版任务队列时配置，详见 docs/报关任务代理接口.md）
+CUSTOMS_TASK_CREATE_TOKEN=
+CUSTOMS_AGENT_TOKEN=
+CUSTOMS_FEISHU_VERIFICATION_TOKEN=
+CUSTOMS_AGENT_LEASE_SECONDS=900
+CUSTOMS_MAX_PDF_FILES=500
+CUSTOMS_MAX_PDF_MB=20
+CUSTOMS_MAX_TOTAL_MB=500
 ```
 
 > `.env` 已在 `.gitignore` 中，不会提交。
@@ -145,18 +154,35 @@ cd "E:\财务\cost matching\cost_matching_ultra"
 
 ### Linux 服务器（当前线上部署）
 
+首次部署：
+
 ```bash
 cd /opt/cost_matching_ultra
 
-# 首次：后端依赖 + 前端构建（改了 web/ 只需再跑最后两行）
+# 后端依赖 + 前端构建
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 cd web && npm install && npm run build && cd ..
 
-# 启动
+# 启动（只使用一个 Uvicorn worker）
 setsid nohup .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8765 \
   >> tmp/workbench.log 2>&1 < /dev/null &
+```
 
-# 重启（改了代码或 .env 都要重启）
+后续从 GitHub 更新：
+
+```bash
+cd /opt/cost_matching_ultra
+
+# 服务器本地有未提交修改时，先备份或提交，否则 git pull 可能拒绝覆盖
+git pull --ff-only
+
+# requirements.txt 有变化时执行
+.venv/bin/pip install -r requirements.txt
+
+# web/ 有变化时执行
+cd web && npm install && npm run build && cd ..
+
+# 每次更新代码或 .env 后重启
 pkill -f "uvicorn app.main:app --host 0.0.0.0 --port 8765"; sleep 2
 setsid nohup .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8765 \
   >> tmp/workbench.log 2>&1 < /dev/null &
@@ -167,6 +193,9 @@ curl -s http://127.0.0.1:8765/api/health
 ```
 
 访问 `http://<服务器IP>:8765/`。改 `web/` 后必须重新 `npm run build`，改 `.env` 必须重启才生效。
+启用飞书报关任务代理时，还需按 `docs/报关任务代理接口.md` 在 `.env` 中配置
+`CUSTOMS_TASK_CREATE_TOKEN`、`CUSTOMS_AGENT_TOKEN` 和 `CUSTOMS_FEISHU_VERIFICATION_TOKEN`；
+该任务队列按单进程设计，使用默认的单个 Uvicorn worker 即可。
 该部署没有域名和反向代理，靠 `.env` 的 `WORKBENCH_TRUST_ALL=1` 让内网直连即可写回；
 置 0 则恢复「本机免口令 + 远端需网关注入 token」的口径。
 
