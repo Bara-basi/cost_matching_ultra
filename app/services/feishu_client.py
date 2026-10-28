@@ -250,6 +250,70 @@ class FeishuClient:
             created.extend(data.get("records", []))
         return {"records": created}
 
+    def batch_update_records(
+        self, app_token: str, table_id: str, rows: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """批量更新记录，rows 每项包含 record_id 和 fields。"""
+        updated: list[dict[str, Any]] = []
+        for start in range(0, len(rows), 500):
+            chunk = rows[start : start + 500]
+            if not chunk:
+                continue
+            data = self._request(
+                "POST",
+                f"/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_update",
+                body={
+                    "records": [
+                        {
+                            "record_id": item["record_id"],
+                            "fields": item["fields"],
+                        }
+                        for item in chunk
+                    ]
+                },
+            )["data"]
+            updated.extend(data.get("records", []))
+        return {"records": updated}
+
+    def upload_bitable_file(self, app_token: str, path: Path) -> str:
+        """上传 PDF 到多维表格 Base，返回可写入附件字段的 file_token。"""
+        import requests
+
+        if not path.is_file():
+            raise ValueError(f"附件不存在：{path}")
+        size = path.stat().st_size
+        if size <= 0:
+            raise ValueError(f"附件为空：{path}")
+        if size > 20 * 1024 * 1024:
+            raise ValueError(f"附件超过多维表格单文件 20MB 限制：{path}")
+        with path.open("rb") as handle:
+            response = requests.post(
+                f"{BASE_URL}/drive/v1/medias/upload_all",
+                headers={"Authorization": f"Bearer {self.tenant_access_token()}"},
+                data={
+                    "file_name": path.name,
+                    "parent_type": "bitable_file",
+                    "parent_node": app_token,
+                    "size": str(size),
+                },
+                files={"file": (path.name, handle, "application/pdf")},
+                timeout=120,
+            )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise FeishuError(response.status_code, response.text[:500]) from exc
+        if response.status_code >= 400 or payload.get("code") != 0:
+            raise FeishuError(
+                int(payload.get("code") or response.status_code),
+                str(payload.get("msg") or response.text[:500]),
+                payload,
+            )
+        token = str((payload.get("data") or {}).get("file_token") or "")
+        if not token:
+            raise FeishuError(-1, "上传成功响应缺少 file_token", payload)
+        return token
+
     def download_attachment(self, attachment: dict[str, Any]) -> bytes:
         """下载目标多维表附件；只接受飞书官方媒体下载地址。"""
         raw_url = str(attachment.get("url") or "")
@@ -272,4 +336,28 @@ class FeishuClient:
         return self._request(
             "POST", f"/bitable/v1/apps/{app_token}/tables/{table_id}/fields",
             body={"field_name": name, "type": field_type},
+        )["data"]
+
+    def set_view_visible_fields(
+        self,
+        app_token: str,
+        table_id: str,
+        view_id: str,
+        visible_fields: list[str],
+    ) -> list[str]:
+        """设置 Base 视图的可见字段及顺序；必须提交完整列表。"""
+        payload = self._request(
+            "PUT",
+            f"/base/v3/bases/{app_token}/tables/{table_id}/views/{view_id}/visible_fields",
+            body={"visible_fields": visible_fields},
+        )
+        data = payload.get("data") or []
+        if not isinstance(data, list):
+            raise FeishuError(-1, "视图可见字段更新响应不是有序列表", payload)
+        return [str(field_id) for field_id in data]
+
+    def delete_field(self, app_token: str, table_id: str, field_id: str) -> dict[str, Any]:
+        return self._request(
+            "DELETE",
+            f"/bitable/v1/apps/{app_token}/tables/{table_id}/fields/{field_id}",
         )["data"]

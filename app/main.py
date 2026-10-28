@@ -17,9 +17,10 @@ from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from app.services import erp_sync, lookup, workspace
+from app.services.feishu_client import get_config
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-APP_VERSION = "2026.10.13-api.1"
+APP_VERSION = "2026.10.27-customs-agent.1"
 
 app = FastAPI(title="成本匹配工作台", version=APP_VERSION)
 WEB_DIST = PROJECT_ROOT / "web" / "dist"
@@ -100,9 +101,35 @@ def _require_evidence_token(request: Request, provided: str = "") -> None:
         raise HTTPException(status_code=403, detail="远端查看 ERP 凭证未启用或缺少内网网关授权")
 
 
+def _require_customs_create_token(provided: str) -> None:
+    configured = get_config("CUSTOMS_TASK_CREATE_TOKEN", "")
+    if not configured:
+        raise HTTPException(status_code=503, detail="未配置 CUSTOMS_TASK_CREATE_TOKEN")
+    if not provided or not secrets.compare_digest(configured, provided):
+        raise HTTPException(status_code=403, detail="飞书任务请求鉴权失败")
+
+
+def _bearer_token(authorization: str) -> str:
+    scheme, _, token = str(authorization or "").partition(" ")
+    return token.strip() if scheme.lower() == "bearer" else ""
+
+
+def _require_customs_agent_token(authorization: str) -> None:
+    configured = get_config("CUSTOMS_AGENT_TOKEN", "")
+    if not configured:
+        raise HTTPException(status_code=503, detail="未配置 CUSTOMS_AGENT_TOKEN")
+    provided = _bearer_token(authorization)
+    if not provided or not secrets.compare_digest(configured, provided):
+        raise HTTPException(status_code=403, detail="财务电脑代理鉴权失败")
+
+
 @app.on_event("startup")
 def _startup() -> None:
     workspace.recover_interrupted()
+    from app.services import customs_tasks as customs_task_queue, customs_task_runner
+
+    customs_task_queue.recover_interrupted()
+    customs_task_runner.resume_uploaded()
     # 定时全量同步：启动时按需跑一次 + 后台每 12 小时一轮（可用环境变量调整）
     try:
         erp_sync.start_scheduler()
@@ -127,7 +154,192 @@ def health(request: Request) -> dict:
         # 打开了整站信任开关（没有域名/网关的直连部署）：写回与凭证不再要口令
         "trustAll": _trust_all(),
         "erpSync": erp_sync.status(),
+        "customsTaskQueue": {
+            "createConfigured": bool(get_config("CUSTOMS_TASK_CREATE_TOKEN", "")),
+            "agentConfigured": bool(get_config("CUSTOMS_AGENT_TOKEN", "")),
+        },
     }
+
+
+@app.post("/api/customs/tasks")
+async def create_customs_task(
+    request: Request,
+    x_customs_task_token: str = Header(""),
+) -> dict:
+    """飞书按钮入口：校验请求并持久化到财务电脑任务队列。"""
+    content_type = str(request.headers.get("content-type") or "").lower()
+    if "application/json" in content_type:
+        try:
+            body = await request.json()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="请求体不是有效 JSON") from exc
+    else:
+        form = await request.form()
+        body = {key: value for key, value in form.items()}
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="请求体必须是对象")
+
+    if body.get("type") == "url_verification":
+        expected = get_config("CUSTOMS_FEISHU_VERIFICATION_TOKEN", "") or get_config(
+            "CUSTOMS_TASK_CREATE_TOKEN", ""
+        )
+        if not expected:
+            raise HTTPException(status_code=503, detail="飞书回调验证令牌未配置")
+        provided = str(body.get("token") or "")
+        if not provided or not secrets.compare_digest(expected, provided):
+            raise HTTPException(status_code=403, detail="飞书回调验证失败")
+        return {"challenge": str(body.get("challenge") or "")}
+
+    _require_customs_create_token(
+        x_customs_task_token
+        or str(body.get("authToken") or body.get("createToken") or "")
+    )
+    nested = body.get("task")
+    if isinstance(nested, dict):
+        task_body = dict(nested)
+        for key in ("idempotencyKey", "requestId", "recordId", "source"):
+            if key in body and key not in task_body:
+                task_body[key] = body[key]
+    else:
+        task_body = body
+    idempotency_header = str(request.headers.get("idempotency-key") or "").strip()
+    if idempotency_header and not task_body.get("idempotencyKey"):
+        task_body["idempotencyKey"] = idempotency_header
+
+    from app.services import customs_tasks as customs_task_queue
+
+    try:
+        task, duplicate = customs_task_queue.create_task(
+            task_body,
+            requested_by=str(
+                body.get("operator")
+                or body.get("requestedBy")
+                or request.headers.get("x-feishu-user-id")
+                or ""
+            ),
+            source=str(body.get("source") or "feishu_button"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except customs_task_queue.TaskConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "taskId": task["id"],
+        "state": task["state"],
+        "duplicate": duplicate,
+        "queuePosition": task.get("queuePosition"),
+        "statusUrl": f"/api/customs/tasks/{task['id']}",
+    }
+
+
+@app.get("/api/customs/tasks/claim")
+def claim_customs_task(
+    authorization: str = Header(""),
+    x_agent_name: str = Header("finance-pc"),
+) -> dict:
+    """财务电脑轮询入口：原子领取最早的一条待处理任务。"""
+    _require_customs_agent_token(authorization)
+    from app.services import customs_tasks as customs_task_queue
+
+    task = customs_task_queue.claim_next(agent_name=x_agent_name or "finance-pc")
+    if task is None:
+        return {"hasTask": False, "task": None}
+    return {
+        "hasTask": True,
+        "task": task,
+        "uploadUrl": f"/api/customs/tasks/{task['id']}/upload",
+        "statusUrl": f"/api/customs/tasks/{task['id']}",
+        "heartbeatUrl": f"/api/customs/tasks/{task['id']}/heartbeat",
+    }
+
+
+@app.post("/api/customs/tasks/{task_id}/heartbeat")
+def heartbeat_customs_task(
+    task_id: str,
+    authorization: str = Header(""),
+    x_agent_name: str = Header("finance-pc"),
+) -> dict:
+    _require_customs_agent_token(authorization)
+    from app.services import customs_tasks as customs_task_queue
+
+    try:
+        task = customs_task_queue.heartbeat(
+            task_id, agent_name=x_agent_name or "finance-pc"
+        )
+    except customs_task_queue.TaskNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except customs_task_queue.TaskConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"taskId": task["id"], "state": task["state"], "leaseExpiresAt": task.get("leaseExpiresAt")}
+
+
+@app.post("/api/customs/tasks/{task_id}/upload", status_code=202)
+async def upload_customs_task_files(
+    task_id: str,
+    files: list[UploadFile] = File(...),
+    agent_name: str = Form(""),
+    x_agent_name: str = Header(""),
+    authorization: str = Header(""),
+) -> dict:
+    """上传本任务的全部 PDF；保存成功后立即启动副本表写回。"""
+    _require_customs_agent_token(authorization)
+    from app.services import customs_tasks as customs_task_queue, customs_task_runner
+
+    payload: list[tuple[str, bytes]] = []
+    for item in files:
+        content = await item.read(customs_task_queue.MAX_FILE_BYTES + 1)
+        if len(content) > customs_task_queue.MAX_FILE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"{item.filename or 'PDF'} 超过单文件大小限制",
+            )
+        payload.append((item.filename or "upload.pdf", content))
+    try:
+        task = customs_task_queue.save_uploads(
+            task_id, payload, agent_name=agent_name or x_agent_name
+        )
+    except customs_task_queue.TaskNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except customs_task_queue.TaskConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    customs_task_runner.start(task_id)
+    return {
+        "taskId": task["id"],
+        "state": task["state"],
+        "fileCount": task["fileCount"],
+        "statusUrl": f"/api/customs/tasks/{task['id']}",
+    }
+
+
+@app.get("/api/customs/tasks/{task_id}")
+def get_customs_task(task_id: str, authorization: str = Header("")) -> dict:
+    _require_customs_agent_token(authorization)
+    from app.services import customs_tasks as customs_task_queue
+
+    try:
+        return customs_task_queue.get_task(task_id)
+    except customs_task_queue.TaskNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/customs/tasks/{task_id}/result")
+def get_customs_task_result(task_id: str, authorization: str = Header("")) -> dict:
+    _require_customs_agent_token(authorization)
+    from app.services import customs_tasks as customs_task_queue
+
+    try:
+        task = customs_task_queue.get_task(task_id)
+        path = customs_task_queue._task_dir(task_id) / "result.json"
+    except customs_task_queue.TaskNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if not path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"结果尚未生成，当前状态：{task.get('state')}",
+        )
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 @app.get("/api/erp/sync")
