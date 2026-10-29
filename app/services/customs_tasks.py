@@ -478,7 +478,7 @@ def mark_completed(task_id: str, summary: dict[str, Any]) -> dict[str, Any]:
             {
                 "state": "completed",
                 "progress": 100,
-                "message": "飞书副本写回完成",
+                "message": "成本匹配 AI 表写回完成",
                 "completedAt": _now(),
                 "summary": summary,
             }

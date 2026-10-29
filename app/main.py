@@ -21,7 +21,7 @@ from app.services import erp_sync, lookup, workspace
 from app.services.feishu_client import get_config
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-APP_VERSION = "2026.10.29-original-ai.1"
+APP_VERSION = "2026.10.29-cost-ai.1"
 
 app = FastAPI(title="成本匹配工作台", version=APP_VERSION)
 WEB_DIST = PROJECT_ROOT / "web" / "dist"
@@ -308,7 +308,7 @@ async def upload_customs_task_files(
     x_agent_name: str = Header(""),
     authorization: str = Header(""),
 ) -> dict:
-    """上传本任务的全部 PDF；保存成功后立即启动正式 AI 表写回。"""
+    """上传本任务的全部 PDF；保存成功后立即启动成本匹配 AI 表写回。"""
     _require_customs_agent_token(authorization)
     from app.services import customs_tasks as customs_task_queue, customs_task_runner
 

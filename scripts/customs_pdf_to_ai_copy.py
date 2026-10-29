@@ -1,4 +1,4 @@
-"""PDF → 解析 → 拆单 → 成本匹配 → 飞书 AI 副本测试写入。"""
+"""PDF → 解析 → 拆单 → 成本匹配 → 飞书成本匹配 AI 表写入。"""
 from __future__ import annotations
 
 import argparse
@@ -24,7 +24,7 @@ from app.services.customs_ingest import (  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="报关 PDF 到飞书 AI 副本测试链路")
+    parser = argparse.ArgumentParser(description="报关 PDF 到飞书成本匹配 AI 表链路")
     parser.add_argument(
         "--pdf-dir",
         type=Path,

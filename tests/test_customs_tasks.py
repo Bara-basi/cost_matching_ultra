@@ -371,7 +371,7 @@ class CustomsTaskRunnerTests(unittest.TestCase):
                          return_value=([], [{"报关单号": "722020260000439783"}], {}),
                      ), \
                      patch(
-                         "app.services.customs_ingest.write_backfill_to_original",
+                         "app.services.customs_ingest.write_backfill_to_cost_table",
                          return_value=summary,
                      ) as writer:
                     runner._process(task["id"])

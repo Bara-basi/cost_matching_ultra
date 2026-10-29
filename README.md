@@ -98,7 +98,11 @@ ERP_PASSWORD=
 LARK_APP_ID=
 LARK_APP_SECRET=
 MT_FINANCE_AI_COPY_APP_TOKEN=     # 目标表所在 base
-MT_FINANCE_AI_COPY_TABLE_ID=      # 目标表（2026年报关记录 AI，可读可写）
+MT_FINANCE_AI_COPY_TABLE_ID=      # 副本联调表（2026年报关记录 AI，可读可写）
+MT_FINANCE_AI_APP_TOKEN=          # 原报关记录表所在 base，用作 PDF 来源
+MT_FINANCE_AI_TABLE_ID=           # 原报关记录表（2026年报关记录 AI，只读来源）
+MT_FINANCE_COST_AI_APP_TOKEN=     # 成本匹配结果表所在 base
+MT_FINANCE_COST_AI_TABLE_ID=tblqFkORyxGkMq5y  # 2026年成本匹配 AI
 
 # 远端写回由可信内网网关注入此密钥；不配置则工作台只允许预览，不允许写回
 WORKBENCH_WRITE_TOKEN=
@@ -333,8 +337,9 @@ curl -s http://127.0.0.1:8765/api/health
 并确认已执行 `playwright install chromium`。日志见 `.cache/erp/reports/erp_sync.log`。
 
 **Q：飞书核对 / 一键同步报「未配置」或「没有权限」**
-检查 `.env` 的 `LARK_APP_ID`、`LARK_APP_SECRET` 与目标表 `MT_FINANCE_AI_COPY_APP_TOKEN`、
-`MT_FINANCE_AI_COPY_TABLE_ID`，并确认应用有该 base 的读写权限（其它 base 可能返回 403）。
+检查 `.env` 的 `LARK_APP_ID`、`LARK_APP_SECRET`、原表 `MT_FINANCE_AI_APP_TOKEN` /
+`MT_FINANCE_AI_TABLE_ID`，以及结果表 `MT_FINANCE_COST_AI_APP_TOKEN` /
+`MT_FINANCE_COST_AI_TABLE_ID`，并确认应用有该 base 的读写权限。
 
 **Q：某条记录显示「缺报关单」**
 说明这张采购单还有报关单没解析到（多为 PDF 未提供）。补齐对应报关单后重跑即可。

@@ -63,6 +63,23 @@ REQUIRED_TASK_FIELDS = (
 
 def cost_table_id() -> str:
     return get_config("MT_FINANCE_AI_COPY_DATA_TABLE_ID", DEFAULT_COST_TABLE_ID)
+
+
+def custom_cost_ai_table() -> tuple[str, str]:
+    """报关核算结果目标表：(app_token, table_id)。
+
+    旧版 ``MT_FINANCE_AI_*`` 继续指向原报关记录表，只作为 PDF 来源。
+    所有解析、拆单和成本匹配结果统一写入独立的「2026年成本匹配 AI」表。
+    """
+    app = get_config("MT_FINANCE_COST_AI_APP_TOKEN", "") or get_config(
+        "MT_FINANCE_AI_APP_TOKEN"
+    )
+    table = get_config("MT_FINANCE_COST_AI_TABLE_ID", "") or get_config(
+        "MT_FINANCE_AI_TABLE_ID"
+    )
+    return app, table
+
+
 LEGACY_COST_FIELDS = (
     "自动成本_采购金额",
     "自动成本_供应商简称",
@@ -1016,10 +1033,9 @@ def write_to_original(
         mode = "copy-ai-fields-only"
         result_name = "copy_ai_write_result.json"
     elif _target == "original":
-        app = get_config("MT_FINANCE_AI_APP_TOKEN")
-        table = get_config("MT_FINANCE_AI_TABLE_ID")
-        mode = "original-ai-fields-only"
-        result_name = "original_ai_write_result.json"
+        app, table = custom_cost_ai_table()
+        mode = "cost-ai-fields-only"
+        result_name = "cost_ai_write_result.json"
     else:
         raise ValueError(f"未知写回目标：{_target}")
     client = FeishuClient()
@@ -1351,7 +1367,7 @@ def _match_desired_records(
     return matched
 
 
-def write_backfill_to_original(
+def write_backfill_to_cost_table(
     *,
     declarations: list[str],
     source_rows: list[dict],
@@ -1361,9 +1377,8 @@ def write_backfill_to_original(
     marker: str,
     wait_seconds: int = 90,
 ) -> WriteSummary:
-    """按业务三元组更新或新增正式表行，并补齐解析事实和 AI 结果。"""
-    app = get_config("MT_FINANCE_AI_APP_TOKEN")
-    table = get_config("MT_FINANCE_AI_TABLE_ID")
+    """按业务三元组更新或新增成本表行，并补齐解析事实和 AI 结果。"""
+    app, table = custom_cost_ai_table()
     client = FeishuClient()
     ai_field_map = ensure_ai_result_fields(client, app, table)
     existing = _records_for_declarations(client, app, table, declarations)
@@ -1508,9 +1523,9 @@ def write_backfill_to_original(
                 aiRecords=len(ai_rows),
                 uploadedFiles=len(set(upload_tokens.values())),
                 workDir=str(work_dir),
-                mode="original-backfill-by-business-key",
+                mode="cost-ai-backfill-by-business-key",
             )
-            (work_dir / "original_backfill_result.json").write_text(
+            (work_dir / "cost_ai_backfill_result.json").write_text(
                 json.dumps(
                     {
                         **asdict(summary),
@@ -1528,7 +1543,12 @@ def write_backfill_to_original(
             return summary
         problem = "；".join(problems[:20])
         time.sleep(2)
-    raise RuntimeError(problem or "正式表业务键回填验证超时")
+    raise RuntimeError(problem or "成本匹配 AI 表业务键回填验证超时")
+
+
+def write_backfill_to_original(**kwargs: Any) -> WriteSummary:
+    """兼容旧调用名；现在写到「2026年成本匹配 AI」表。"""
+    return write_backfill_to_cost_table(**kwargs)
 
 
 def write_to_copy_ai_fields(

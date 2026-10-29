@@ -16,11 +16,12 @@ from app.services.customs_ingest import (
     _match_desired_records,
     build_records,
     candidate_declarations,
+    custom_cost_ai_table,
     date_millis,
     ensure_ai_result_fields,
     fee_number,
     original_ai_fields,
-    write_backfill_to_original,
+    write_backfill_to_cost_table,
 )
 
 
@@ -269,7 +270,12 @@ class CustomsIngestTests(unittest.TestCase):
         }
         with TemporaryDirectory() as temp, patch(
             "app.services.customs_ingest.get_config",
-            side_effect=lambda name, _default=None: {"MT_FINANCE_AI_APP_TOKEN": "app", "MT_FINANCE_AI_TABLE_ID": "table"}[name],
+            side_effect=lambda name, _default=None: {
+                "MT_FINANCE_COST_AI_APP_TOKEN": "cost-app",
+                "MT_FINANCE_COST_AI_TABLE_ID": "cost-table",
+                "MT_FINANCE_AI_APP_TOKEN": "source-app",
+                "MT_FINANCE_AI_TABLE_ID": "source-table",
+            }[name],
         ), patch("app.services.customs_ingest.FeishuClient", return_value=FakeClient()), patch(
             "app.services.customs_ingest.ensure_ai_result_fields",
             return_value={},
@@ -277,7 +283,7 @@ class CustomsIngestTests(unittest.TestCase):
             "app.services.customs_ingest._records_for_declarations",
             return_value={"D1": [record]},
         ):
-            summary = write_backfill_to_original(
+            summary = write_backfill_to_cost_table(
                 declarations=["D1"],
                 source_rows=[desired],
                 ai_rows=[desired],
@@ -286,11 +292,26 @@ class CustomsIngestTests(unittest.TestCase):
                 marker="test",
                 wait_seconds=1,
             )
-        self.assertEqual(summary.mode, "original-backfill-by-business-key")
+        self.assertEqual(summary.mode, "cost-ai-backfill-by-business-key")
         self.assertEqual(record["fields"]["合同号_1"], "26MT-01A100")
         self.assertEqual(record["fields"]["报关品名"], "不锈钢法兰")
         self.assertEqual(record["fields"]["采购金额AI"], 80)
         self.assertNotIn(PROTECTED_PURCHASE_FIELD, record["fields"])
+
+    def test_cost_ai_target_has_independent_configuration(self):
+        with patch(
+            "app.services.customs_ingest.get_config",
+            side_effect=lambda name, default=None: {
+                "MT_FINANCE_COST_AI_APP_TOKEN": "cost-app",
+                "MT_FINANCE_COST_AI_TABLE_ID": "cost-table",
+                "MT_FINANCE_AI_APP_TOKEN": "source-app",
+                "MT_FINANCE_AI_TABLE_ID": "source-table",
+            }.get(name, default),
+        ):
+            self.assertEqual(
+                custom_cost_ai_table(),
+                ("cost-app", "cost-table"),
+            )
 
 
 if __name__ == "__main__":
