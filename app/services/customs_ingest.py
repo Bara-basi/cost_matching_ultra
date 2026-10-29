@@ -38,6 +38,22 @@ AI_RESULT_FIELD_SPECS = (
     ("分摊依据", "采购金额分摊依据AI", 1),
     ("采购金额", "采购金额AI", 2),
 )
+ORIGINAL_PARSED_FIELDS = (
+    "合同号_1",
+    "合同号（应收表格）",
+    "销售方式",
+    "出口日期",
+    "报关品名",
+    "海关编码",
+    "运输方式",
+    "运费",
+    "保费",
+    "报关金额",
+    "币种",
+    "报关重量",
+    "报关重量单位",
+    "国家",
+)
 REQUIRED_TASK_FIELDS = (
     ("报关单号", "报关单号", 1),
     ("pdf原件", "pdf原件", 17),
@@ -203,6 +219,11 @@ def build_records(
             raise ValueError(f"{declaration} 的原始 PDF 不存在：{pdf}")
         pdfs[declaration] = pdf
         meta = (metadata.get(declaration) or [{}])[0]
+        sales_mode = (
+            "预录"
+            if str(meta.get("单据类型") or "").startswith("预录")
+            else "出口"
+        )
         freight = _allocated_fee(rows, meta, "运费")
         insurance = _allocated_fee(rows, meta, "保费")
         for index, row in enumerate(rows):
@@ -212,7 +233,7 @@ def build_records(
             common = {
                 "合同号_1": str(row.get("合同号_1") or ""),
                 "合同号（应收表格）": str(row.get("合同号（应收表格）") or ""),
-                "销售方式": "出口",
+                "销售方式": sales_mode,
                 "报关单号": declaration,
                 "出口日期": date_millis(meta.get("出口日期")),
                 "报关品名": str(row.get("报关品名") or ""),
@@ -253,6 +274,10 @@ def build_records(
             ai_rows.append(
                 {
                     **common,
+                    "供应商简称": supplier,
+                    "供应商": str(row.get("供应商名称") or ""),
+                    "产品类型": product_type,
+                    "采购订单号": purchase,
                     "分摊依据": str(row.get("分摊依据") or ""),
                     "采购金额": float(decimal_value(row.get("采购金额")) or 0),
                     "拆单状态": split_status,
@@ -912,8 +937,21 @@ def ensure_ai_result_fields(
 
 
 def original_ai_fields(row: dict) -> dict:
-    """把拆单/成本结果写入同名 AI 字段，原表业务字段只保留报关单号。"""
+    """把拆单、成本结果和报关解析事实写入正式表字段。"""
     values: dict[str, Any] = {"报关单号": str(row.get("报关单号") or "")}
+    for field in ORIGINAL_PARSED_FIELDS:
+        if field not in row:
+            continue
+        raw = row.get(field)
+        if isinstance(raw, list):
+            raw = "、".join(
+                str(item.get("text") or item.get("name") or item)
+                if isinstance(item, dict)
+                else str(item)
+                for item in raw
+                if item
+            )
+        values[field] = raw
     for source, target, field_type in AI_RESULT_FIELD_SPECS:
         raw = row.get(source)
         if field_type == 2:
@@ -1169,6 +1207,263 @@ def write_to_original(
         problem = "；".join(problems)
         time.sleep(2)
     raise RuntimeError(problem or "原 AI 表写入验证超时")
+
+
+def _match_desired_records(
+    desired_rows: list[dict],
+    records: list[dict],
+) -> list[dict | None]:
+    """按报关单号、供应商、产品类型匹配；同键多行再用金额/重量区分。"""
+    remaining = list(records)
+    matched: list[dict | None] = []
+    for index, row in enumerate(desired_rows):
+        amount = decimal_value(row.get("报关金额"))
+        weight = decimal_value(row.get("报关重量"))
+        supplier = str(row.get("供应商") or "").strip()
+        product = str(row.get("产品类型") or "").strip()
+
+        def same_key(record: dict) -> bool:
+            fields = record.get("fields") or {}
+            return (
+                _first_text(fields.get("供应商")) == supplier
+                and _first_text(fields.get("产品类型(对内)")) == product
+            )
+
+        candidates = [record for record in remaining if same_key(record)]
+        exact = [
+            record
+            for record in candidates
+            if decimal_value(
+                _record_value(record, "报关金额AI")
+                if _record_value(record, "报关金额AI") not in (None, "")
+                else _record_value(record, "报关金额")
+            )
+            == amount
+            and decimal_value(
+                _record_value(record, "报关重量AI")
+                if _record_value(record, "报关重量AI") not in (None, "")
+                else _record_value(record, "报关重量")
+            )
+            == weight
+        ]
+        choice = exact[0] if len(exact) == 1 else candidates[0] if len(candidates) == 1 else None
+
+        if choice is None:
+            exact_any = [
+                record
+                for record in remaining
+                if decimal_value(
+                    _record_value(record, "报关金额AI")
+                    if _record_value(record, "报关金额AI") not in (None, "")
+                    else _record_value(record, "报关金额")
+                )
+                == amount
+                and decimal_value(
+                    _record_value(record, "报关重量AI")
+                    if _record_value(record, "报关重量AI") not in (None, "")
+                    else _record_value(record, "报关重量")
+                )
+                == weight
+            ]
+            if len(exact_any) == 1:
+                choice = exact_any[0]
+
+        if choice is None and index == 0:
+            empty_keys = [
+                record
+                for record in remaining
+                if not _first_text((record.get("fields") or {}).get("供应商"))
+                or not _first_text((record.get("fields") or {}).get("产品类型(对内)"))
+            ]
+            if empty_keys:
+                choice = empty_keys[0]
+            elif len(desired_rows) == 1 and len(remaining) == 1:
+                choice = remaining[0]
+
+        matched.append(choice)
+        if choice:
+            remaining.remove(choice)
+    return matched
+
+
+def write_backfill_to_original(
+    *,
+    declarations: list[str],
+    source_rows: list[dict],
+    ai_rows: list[dict],
+    pdfs: dict[str, Path],
+    work_dir: Path,
+    marker: str,
+    wait_seconds: int = 90,
+) -> WriteSummary:
+    """按业务三元组更新或新增正式表行，并补齐解析事实和 AI 结果。"""
+    app = get_config("MT_FINANCE_AI_APP_TOKEN")
+    table = get_config("MT_FINANCE_AI_TABLE_ID")
+    client = FeishuClient()
+    ai_field_map = ensure_ai_result_fields(client, app, table)
+    existing = _records_for_declarations(client, app, table, declarations)
+
+    upload_tokens: dict[str, str] = {}
+    for declaration in declarations:
+        token = ""
+        for record in existing.get(declaration) or []:
+            attachments = (record.get("fields") or {}).get("pdf原件") or []
+            if attachments:
+                token = str((attachments[0] or {}).get("file_token") or "")
+                if token:
+                    break
+        upload_tokens[declaration] = token or client.upload_bitable_file(
+            app, pdfs[declaration]
+        )
+
+    updates: list[dict] = []
+    creates: list[dict] = []
+    expected: dict[str, list[str]] = {}
+    for declaration in declarations:
+        desired_rows = [
+            row
+            for row in ai_rows
+            if str(row.get("报关单号") or "") == declaration
+        ]
+        records = list(existing.get(declaration) or [])
+        matched = _match_desired_records(desired_rows, records)
+        expected[declaration] = [
+            str(record.get("record_id") or "") if record else ""
+            for record in matched
+        ]
+        for index, (row, record) in enumerate(zip(desired_rows, matched)):
+            fields = original_ai_fields(row)
+            fields["pdf原件"] = (
+                [{"file_token": upload_tokens[declaration]}] if index == 0 else []
+            )
+            if record:
+                updates.append(
+                    {"record_id": str(record["record_id"]), "fields": fields}
+                )
+            else:
+                creates.append(fields)
+
+    if updates:
+        client.batch_update_records(app, table, updates)
+    if creates:
+        client.batch_create_records(app, table, creates)
+
+    deadline = time.monotonic() + wait_seconds
+    problem = ""
+    while time.monotonic() < deadline:
+        found = _records_for_declarations(client, app, table, declarations)
+        matched_by_declaration: dict[str, list[dict]] = {}
+        missing: list[str] = []
+        for declaration in declarations:
+            desired_rows = [
+                row
+                for row in ai_rows
+                if str(row.get("报关单号") or "") == declaration
+            ]
+            matched_records = _match_desired_records(
+                desired_rows, list(found.get(declaration) or [])
+            )
+            if any(record is None for record in matched_records):
+                missing.append(declaration)
+                continue
+            matched_by_declaration[declaration] = [
+                record for record in matched_records if record is not None
+            ]
+        if missing:
+            problem = f"以下报关单尚未匹配到目标行：{missing}"
+            time.sleep(2)
+            continue
+
+        problems: list[str] = []
+        for declaration, records in matched_by_declaration.items():
+            desired_rows = [
+                row
+                for row in ai_rows
+                if str(row.get("报关单号") or "") == declaration
+            ]
+            for row, record in zip(desired_rows, records):
+                numeric_parsed_fields = {
+                    "出口日期",
+                    "运费",
+                    "保费",
+                    "报关金额",
+                    "报关重量",
+                }
+                for source, target, field_type in AI_RESULT_FIELD_SPECS:
+                    expected_value = (
+                        decimal_value(row.get(source))
+                        if field_type == 2
+                        else _first_text(row.get(source))
+                    )
+                    actual_value = (
+                        decimal_value(_record_value(record, target))
+                        if field_type == 2
+                        else _first_text(_record_value(record, target))
+                    )
+                    if expected_value != actual_value:
+                        problems.append(f"{declaration}: {target} 未正确回填")
+                        break
+                for field in ORIGINAL_PARSED_FIELDS:
+                    if field not in row:
+                        continue
+                    if field in numeric_parsed_fields:
+                        expected_value = decimal_value(row.get(field))
+                        actual_value = decimal_value(_record_value(record, field))
+                    else:
+                        expected_value = _first_text(row.get(field))
+                        actual_value = _first_text(_record_value(record, field))
+                    if expected_value != actual_value:
+                        problems.append(f"{declaration}: {field} 未正确回填")
+                        break
+                if _first_text(_record_value(record, "拆单状态")) != str(
+                    row.get("拆单状态") or "正常"
+                ):
+                    problems.append(f"{declaration}: 拆单状态未正确回填")
+                if _first_text(_record_value(record, "成本匹配状态")) != str(
+                    row.get("成本匹配状态") or "正常"
+                ):
+                    problems.append(f"{declaration}: 成本匹配状态未正确回填")
+            attachments = [
+                len((record.get("fields") or {}).get("pdf原件") or [])
+                for record in records
+            ]
+            if attachments[:1] != [1] or any(attachments[1:]):
+                problems.append(f"{declaration}: PDF 未仅附在第一条目标行")
+
+        if not problems:
+            record_ids = [
+                str(record.get("record_id") or "")
+                for records in matched_by_declaration.values()
+                for record in records
+            ]
+            summary = WriteSummary(
+                marker=marker,
+                declarations=declarations,
+                sourceRecords=len(source_rows),
+                aiRecords=len(ai_rows),
+                uploadedFiles=len(set(upload_tokens.values())),
+                workDir=str(work_dir),
+                mode="original-backfill-by-business-key",
+            )
+            (work_dir / "original_backfill_result.json").write_text(
+                json.dumps(
+                    {
+                        **asdict(summary),
+                        "recordIds": record_ids,
+                        "fileTokens": upload_tokens,
+                        "matchedBefore": expected,
+                        "protectedPurchaseFieldWritten": False,
+                        "sourceTableTouched": False,
+                    },
+                    ensure_ascii=False,
+                    indent=1,
+                ),
+                encoding="utf-8",
+            )
+            return summary
+        problem = "；".join(problems[:20])
+        time.sleep(2)
+    raise RuntimeError(problem or "正式表业务键回填验证超时")
 
 
 def write_to_copy_ai_fields(

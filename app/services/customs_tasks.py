@@ -216,7 +216,7 @@ def create_task(
 def claim_next(*, agent_name: str, lease_seconds: int = DEFAULT_LEASE_SECONDS) -> dict[str, Any] | None:
     now = datetime.now(timezone.utc)
     with _LOCK:
-        candidates = []
+        candidates: list[tuple[int, dict[str, Any]]] = []
         for task in _all_tasks():
             state = task.get("state")
             eligible = state == "queued"
@@ -227,10 +227,17 @@ def claim_next(*, agent_name: str, lease_seconds: int = DEFAULT_LEASE_SECONDS) -
                 except ValueError:
                     eligible = True
             if eligible:
-                candidates.append(task)
+                candidates.append((0 if state == "queued" else 1, task))
         if not candidates:
             return None
-        task = candidates[0]
+        candidates.sort(
+            key=lambda item: (
+                item[0],
+                str(item[1].get("createdAt") or ""),
+                str(item[1].get("id") or ""),
+            )
+        )
+        task = candidates[0][1]
         task.update(
             {
                 "state": "claimed",

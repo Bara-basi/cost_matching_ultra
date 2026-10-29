@@ -185,26 +185,58 @@ def _declaration_key(row: dict) -> tuple[str, str, str, str] | None:
 
 
 def parse_pdfs(pdf_paths: list[Path], out_xlsx: Path) -> dict:
-    """解析报关单 PDF → 出口退税联 xlsx（与 `scripts/parse_customs.py` 同口径）。"""
+    """解析正式报关单和预录单 PDF，输出成本匹配可消费的统一行结构。
+
+    同一报关单同时存在正式单和预录单时，正式单优先；预录单仅用于
+    补充没有正式 PDF 的报关单。
+    """
+    from app.services.parser.pre_record_parser import parse_pre_record
+
     rows: list[dict] = []
     failed: list[dict] = []
     warnings: Counter = Counter()
+    formal_declarations: set[str] = set()
     for path in pdf_paths:
         try:
             parsed = parse_declaration(path)
         except Exception as exc:  # noqa: BLE001
             failed.append({"文件": path.name, "原因": str(exc)})
             continue
-        warnings.update(parsed.warnings)
-        if parsed.header.sheet_type != "出口退税联":
+        sheet_type = parsed.header.sheet_type
+        if sheet_type == "预录单（仅供核对用）":
+            try:
+                parsed = parse_pre_record(path)
+            except Exception as exc:  # noqa: BLE001
+                failed.append({"文件": path.name, "原因": str(exc)})
+                continue
+        elif sheet_type != "出口退税联":
             continue
+        warnings.update(parsed.warnings)
         for row in build_parse_rows(parsed):
             if out_of_scope_reason(str(row.get("合同号_1") or "")):
                 continue
+            row["单据类型"] = (
+                "出口退税联" if parsed.header.sheet_type == "出口退税联" else "预录单"
+            )
+            if row["单据类型"] == "出口退税联" and row.get("报关单号"):
+                formal_declarations.add(str(row["报关单号"]))
             rows.append(row)
+
+    rows = [
+        row
+        for row in rows
+        if row.get("单据类型") == "出口退税联"
+        or str(row.get("报关单号") or "") not in formal_declarations
+    ]
     if rows:
         write_workbook(rows, out_xlsx)
-    return {"rows": len(rows), "failed": failed, "warnings": dict(warnings)}
+    return {
+        "rows": len(rows),
+        "failed": failed,
+        "warnings": dict(warnings),
+        "formalRows": sum(row.get("单据类型") == "出口退税联" for row in rows),
+        "preRecordRows": sum(row.get("单据类型") == "预录单" for row in rows),
+    }
 
 
 def run_split(parse_xlsx: Path, out_dir: Path, only: str = "") -> dict:

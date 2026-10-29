@@ -85,6 +85,17 @@ class CustomsTaskQueueTests(unittest.TestCase):
         self.assertEqual(queue.recover_interrupted(), [task["id"]])
         self.assertEqual(queue.get_task(task["id"])["state"], "uploaded")
 
+    def test_new_queued_task_wins_over_expired_claim(self):
+        stale, _ = queue.create_task({"flow": "export"})
+        queue.claim_next(agent_name="pc-old")
+        stale_task = queue.get_task(stale["id"])
+        stale_task["leaseExpiresAt"] = "2000-01-01T00:00:00+00:00"
+        queue._save_task(stale_task)
+        fresh, _ = queue.create_task({"flow": "pre_record"})
+
+        claimed = queue.claim_next(agent_name="pc-new")
+        self.assertEqual(claimed["id"], fresh["id"])
+
     def test_report_error_blocks_task_and_is_idempotent(self):
         task, _ = queue.create_task({"flow": "export"})
         queue.claim_next(agent_name="pc-1")
@@ -360,7 +371,7 @@ class CustomsTaskRunnerTests(unittest.TestCase):
                          return_value=([], [{"报关单号": "722020260000439783"}], {}),
                      ), \
                      patch(
-                         "app.services.customs_ingest.write_to_original",
+                         "app.services.customs_ingest.write_backfill_to_original",
                          return_value=summary,
                      ) as writer:
                     runner._process(task["id"])
