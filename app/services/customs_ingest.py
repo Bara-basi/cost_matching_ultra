@@ -1267,6 +1267,7 @@ def _match_desired_records(
         basis = str(row.get("分摊依据") or "").strip()
         supplier = str(row.get("供应商") or "").strip()
         product = str(row.get("产品类型") or "").strip()
+        product_name = str(row.get("报关品名") or "").strip()
 
         def same_key(record: dict) -> bool:
             fields = record.get("fields") or {}
@@ -1308,6 +1309,14 @@ def _match_desired_records(
             ]
             if basis_matches:
                 refined = basis_matches
+        if len(refined) > 1 and product_name:
+            name_matches = [
+                record
+                for record in refined
+                if _first_text(_record_value(record, "报关品名")) == product_name
+            ]
+            if name_matches:
+                refined = name_matches
         if refined:
             choice = sorted(
                 refined,
@@ -1348,6 +1357,14 @@ def _match_desired_records(
                     if decimal_value(_record_value(record, "采购金额AI")) == cost
                     and _first_text(_record_value(record, "采购金额分摊依据AI")) == basis
                 ]
+                if len(refined_any) > 1 and product_name:
+                    name_matches = [
+                        record
+                        for record in refined_any
+                        if _first_text(_record_value(record, "报关品名")) == product_name
+                    ]
+                    if name_matches:
+                        refined_any = name_matches
                 if refined_any:
                     choice = sorted(
                         refined_any,

@@ -155,6 +155,42 @@ class CustomsIngestTests(unittest.TestCase):
         )
         self.assertEqual([item["record_id"] for item in matched], ["R80", "R20"])
 
+    def test_duplicate_error_rows_use_customs_product_name(self):
+        desired = [
+            {
+                "报关单号": "D1",
+                "报关品名": "镍合金板材",
+                "供应商": "",
+                "产品类型": "",
+                "报关金额": 0,
+                "报关重量": 0,
+                "采购金额": 0,
+                "分摊依据": "",
+            },
+            {
+                "报关单号": "D1",
+                "报关品名": "镍合金带材",
+                "供应商": "",
+                "产品类型": "",
+                "报关金额": 0,
+                "报关重量": 0,
+                "采购金额": 0,
+                "分摊依据": "",
+            },
+        ]
+        records = [
+            {
+                "record_id": "R-B",
+                "fields": {"报关品名": [{"text": "镍合金带材"}]},
+            },
+            {
+                "record_id": "R-A",
+                "fields": {"报关品名": [{"text": "镍合金板材"}]},
+            },
+        ]
+        matched = _match_desired_records(desired, records)
+        self.assertEqual([item["record_id"] for item in matched], ["R-A", "R-B"])
+
     def test_all_result_fields_get_ai_columns(self):
         class FakeClient:
             def __init__(self):
