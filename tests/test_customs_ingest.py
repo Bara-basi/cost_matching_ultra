@@ -58,6 +58,9 @@ class CustomsIngestTests(unittest.TestCase):
             "报关品名": "不锈钢管",
             "报关金额": "123.45",
             "报关重量": "20",
+            "供应商简称": "甲供",
+            "供应商": "甲供应商有限公司",
+            "产品类型": "法兰",
             PROTECTED_PURCHASE_FIELD: "123.45",
             "拆单状态": "正常",
             "成本匹配状态": "正常",
@@ -68,6 +71,8 @@ class CustomsIngestTests(unittest.TestCase):
         self.assertEqual(fields["报关单号"], "D1")
         self.assertEqual(fields["合同号_1"], "26MT-01A100")
         self.assertEqual(fields["报关品名"], "不锈钢管")
+        self.assertEqual(fields["供应商"], "甲供应商有限公司")
+        self.assertEqual(fields["产品类型AI"], "法兰")
 
     def test_business_key_match_uses_supplier_product_and_amount(self):
         desired = [
@@ -175,7 +180,7 @@ class CustomsIngestTests(unittest.TestCase):
         self.assertEqual(fields["报关重量AI"]["type"], 2)
         self.assertEqual(fields["合同号AI"]["type"], 1)
         self.assertIn("采购金额分摊依据AI", fields)
-        self.assertEqual(len(fields), 5)
+        self.assertEqual(len(fields), 7)
 
     def test_single_split_row_is_valid_for_server_task(self):
         parsed = [

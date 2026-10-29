@@ -21,7 +21,7 @@ from app.services import erp_sync, lookup, workspace
 from app.services.feishu_client import get_config
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-APP_VERSION = "2026.10.29-cost-ai.2"
+APP_VERSION = "2026.10.29-cost-ai.3"
 
 app = FastAPI(title="成本匹配工作台", version=APP_VERSION)
 WEB_DIST = PROJECT_ROOT / "web" / "dist"

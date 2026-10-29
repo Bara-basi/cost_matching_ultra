@@ -35,6 +35,8 @@ AI_RESULT_FIELD_SPECS = (
     ("合同号_1", "合同号AI", 1),
     ("报关金额", "报关金额AI", 2),
     ("报关重量", "报关重量AI", 2),
+    ("供应商", "供应商", 1),
+    ("产品类型", "产品类型AI", 1),
     ("分摊依据", "采购金额分摊依据AI", 1),
     ("采购金额", "采购金额AI", 2),
 )
@@ -1025,7 +1027,7 @@ def write_to_original(
     wait_seconds: int = 60,
     _target: str = "original",
 ) -> WriteSummary:
-    """写一个 AI 结果表：五个 AI 字段、两个状态及去重后的 PDF。"""
+    """写一个 AI 结果表：拆单/成本字段、两个状态及去重后的 PDF。"""
     del source_rows  # 兼容既有调用签名；来源表明确不在本链路中访问。
     if _target == "copy":
         app = get_config("MT_FINANCE_AI_COPY_APP_TOKEN")
@@ -1269,8 +1271,11 @@ def _match_desired_records(
         def same_key(record: dict) -> bool:
             fields = record.get("fields") or {}
             return (
-                _first_text(fields.get("供应商")) == supplier
-                and _first_text(fields.get("产品类型(对内)")) == product
+                _first_text(fields.get("供应商AI") or fields.get("供应商")) == supplier
+                and _first_text(
+                    fields.get("产品类型AI") or fields.get("产品类型(对内)")
+                )
+                == product
             )
 
         candidates = [record for record in remaining if same_key(record)]
@@ -1353,8 +1358,14 @@ def _match_desired_records(
             empty_keys = [
                 record
                 for record in remaining
-                if not _first_text((record.get("fields") or {}).get("供应商"))
-                or not _first_text((record.get("fields") or {}).get("产品类型(对内)"))
+                if not _first_text(
+                    (record.get("fields") or {}).get("供应商AI")
+                    or (record.get("fields") or {}).get("供应商")
+                )
+                or not _first_text(
+                    (record.get("fields") or {}).get("产品类型AI")
+                    or (record.get("fields") or {}).get("产品类型(对内)")
+                )
             ]
             if empty_keys:
                 choice = empty_keys[0]
