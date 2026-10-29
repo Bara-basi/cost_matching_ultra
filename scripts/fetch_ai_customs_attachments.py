@@ -210,7 +210,7 @@ def main() -> None:
     manifest["source"] = source_name
     manifest["month"] = month
 
-    client = FeishuClient()
+    client = FeishuClient(timeout=120)
     records = list(client.iter_records(app_token, table_id))
     selected: list[dict] = []
     for record in records:
