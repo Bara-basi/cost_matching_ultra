@@ -8,13 +8,14 @@ from __future__ import annotations
 import json
 import os
 import secrets
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.services import erp_sync, lookup, workspace
 from app.services.feishu_client import get_config
@@ -55,6 +56,32 @@ class SourceMappingRequest(BaseModel):
     row_index: int
     source_id: str
     operator: str
+
+
+class CustomsTaskErrorRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    agentName: str = Field(min_length=1, max_length=100)
+    errorCode: str = Field(min_length=1, max_length=64)
+    message: str = Field(min_length=1, max_length=2000)
+    retryable: bool
+    reportedAt: datetime
+    details: dict[str, object] = Field(default_factory=dict)
+
+    @field_validator("agentName", "errorCode", "message")
+    @classmethod
+    def strip_required_text(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("不能为空")
+        return cleaned
+
+    @field_validator("reportedAt")
+    @classmethod
+    def require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("reportedAt 必须包含时区")
+        return value
 
 
 # 本机（127.0.0.1 / ::1）视为可信：财务在自己电脑上操作，不再需要额外口令。
@@ -310,6 +337,50 @@ async def upload_customs_task_files(
         "state": task["state"],
         "fileCount": task["fileCount"],
         "statusUrl": f"/api/customs/tasks/{task['id']}",
+    }
+
+
+@app.post("/api/customs/tasks/{task_id}/report-error")
+def report_customs_task_error(
+    task_id: str,
+    request: CustomsTaskErrorRequest,
+    authorization: str = Header(""),
+    x_agent_name: str = Header(""),
+) -> dict:
+    """财务电脑无法继续任务时上报业务原因，不触发 PDF 解析。"""
+    _require_customs_agent_token(authorization)
+    header_agent = str(x_agent_name or "").strip()
+    if not header_agent or not secrets.compare_digest(header_agent, request.agentName):
+        raise HTTPException(status_code=403, detail="X-Agent-Name 与请求体 agentName 不一致")
+    from app.services import customs_tasks as customs_task_queue
+
+    try:
+        task = customs_task_queue.report_task_error(
+            task_id,
+            agent_name=request.agentName,
+            error_code=request.errorCode,
+            message=request.message,
+            retryable=request.retryable,
+            reported_at=request.reportedAt.isoformat(),
+            details=request.details,
+        )
+    except customs_task_queue.TaskNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except customs_task_queue.TaskForbidden as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except customs_task_queue.TaskConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "taskId": task["id"],
+        "state": task["state"],
+        "errorCode": task["errorCode"],
+        "message": task["errorMessage"],
+        "retryable": task["errorRetryable"],
+        "errorReportedAt": task["errorReportedAt"],
+        "errorReceivedAt": task["errorReceivedAt"],
+        "agentName": task["errorAgentName"],
     }
 
 

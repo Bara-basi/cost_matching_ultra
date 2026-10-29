@@ -33,6 +33,10 @@ class TaskConflict(RuntimeError):
     pass
 
 
+class TaskForbidden(PermissionError):
+    pass
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -259,6 +263,95 @@ def heartbeat(
             datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
         ).isoformat(timespec="seconds")
         return _save_task(task, "heartbeat", {"agentName": agent_name})
+
+
+def report_task_error(
+    task_id: str,
+    *,
+    agent_name: str,
+    error_code: str,
+    message: str,
+    retryable: bool,
+    reported_at: str,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """记录财务电脑无法继续任务的业务原因，不启动 PDF 处理。"""
+    error_code = str(error_code or "").strip()
+    message = str(message or "").strip()
+    agent_name = str(agent_name or "").strip()
+    if not error_code or len(error_code) > 64:
+        raise ValueError("errorCode 必须为 1 到 64 个字符")
+    if not message or len(message) > 2000:
+        raise ValueError("message 必须为 1 到 2000 个字符")
+    if not agent_name or len(agent_name) > 100:
+        raise ValueError("agentName 必须为 1 到 100 个字符")
+    detail_payload = details or {}
+    if not isinstance(detail_payload, dict):
+        raise ValueError("details 必须是 JSON 对象")
+    if len(json.dumps(detail_payload, ensure_ascii=False, default=str)) > 8000:
+        raise ValueError("details 过大")
+
+    with _LOCK:
+        task = get_task(task_id)
+        state = str(task.get("state") or "")
+        owner = str(task.get("agentName") or "")
+        if state in {"failed", "blocked"}:
+            error_agent = str(task.get("errorAgentName") or "")
+            if error_agent != agent_name:
+                raise TaskForbidden("任务失败信息已由其他 Agent 上报")
+            if (
+                str(task.get("errorCode") or "") == error_code
+                and error_agent == agent_name
+            ):
+                return task
+            raise TaskConflict(f"任务已处于 {state} 状态，不能覆盖原失败信息")
+        if state != "claimed":
+            raise TaskConflict(f"任务状态 {state} 不允许上报失败")
+        if owner != agent_name:
+            raise TaskForbidden("任务不是由该 Agent 领取")
+        lease_expires = str(task.get("leaseExpiresAt") or "")
+        try:
+            if lease_expires and _parse_time(lease_expires) <= datetime.now(timezone.utc):
+                raise TaskConflict("任务租约已过期，请重新领取")
+        except ValueError:
+            raise TaskConflict("任务租约无效，请重新领取")
+
+        task_dir = _task_dir(task_id)
+        for path in task_dir.glob(".uploads.*"):
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+        uploads = task_dir / "uploads"
+        if uploads.exists():
+            shutil.rmtree(uploads)
+
+        received_at = _now()
+        next_state = "blocked" if retryable else "failed"
+        task.update(
+            {
+                "state": next_state,
+                "message": f"任务{('阻塞' if retryable else '失败')}：{message}",
+                "errorCode": error_code,
+                "errorMessage": message,
+                "errorRetryable": bool(retryable),
+                "errorReportedAt": reported_at,
+                "errorReceivedAt": received_at,
+                "errorAgentName": agent_name,
+                "errorDetails": detail_payload,
+                "error": message,
+                "blockedAt" if retryable else "failedAt": received_at,
+            }
+        )
+        if not retryable:
+            task["progress"] = 100
+        return _save_task(
+            task,
+            "error-reported",
+            {
+                "errorCode": error_code,
+                "retryable": bool(retryable),
+                "agentName": agent_name,
+            },
+        )
 
 
 def _write_pdf(path: Path, content: bytes) -> None:

@@ -85,6 +85,87 @@ class CustomsTaskQueueTests(unittest.TestCase):
         self.assertEqual(queue.recover_interrupted(), [task["id"]])
         self.assertEqual(queue.get_task(task["id"])["state"], "uploaded")
 
+    def test_report_error_blocks_task_and_is_idempotent(self):
+        task, _ = queue.create_task({"flow": "export"})
+        queue.claim_next(agent_name="pc-1")
+        reported = queue.report_task_error(
+            task["id"],
+            agent_name="pc-1",
+            error_code="CARD_READ_FAILED",
+            message="卡介质未连接",
+            retryable=True,
+            reported_at="2026-10-29T13:24:33+08:00",
+            details={"phase": "login"},
+        )
+        self.assertEqual(reported["state"], "blocked")
+        self.assertEqual(reported["errorCode"], "CARD_READ_FAILED")
+        self.assertEqual(reported["errorRetryable"], True)
+        self.assertTrue(reported["blockedAt"])
+        self.assertFalse((self.root / "tasks" / task["id"] / "uploads").exists())
+
+        repeated = queue.report_task_error(
+            task["id"],
+            agent_name="pc-1",
+            error_code="CARD_READ_FAILED",
+            message="不同文字不影响同错误码幂等",
+            retryable=True,
+            reported_at="2026-10-29T13:25:00+08:00",
+        )
+        self.assertEqual(repeated["errorReceivedAt"], reported["errorReceivedAt"])
+        with self.assertRaises(queue.TaskForbidden):
+            queue.report_task_error(
+                task["id"],
+                agent_name="pc-2",
+                error_code="CARD_READ_FAILED",
+                message="其他电脑",
+                retryable=True,
+                reported_at="2026-10-29T13:25:00+08:00",
+            )
+
+    def test_non_retryable_error_becomes_failed(self):
+        task, _ = queue.create_task({"flow": "export"})
+        queue.claim_next(agent_name="pc-1")
+        reported = queue.report_task_error(
+            task["id"],
+            agent_name="pc-1",
+            error_code="DOWNLOAD_EMPTY",
+            message="没有待下载数据",
+            retryable=False,
+            reported_at="2026-10-29T13:24:33+08:00",
+        )
+        self.assertEqual(reported["state"], "failed")
+        self.assertEqual(reported["progress"], 100)
+
+    def test_report_error_rejects_expired_lease_and_uploaded_task(self):
+        task, _ = queue.create_task({"flow": "export"})
+        queue.claim_next(agent_name="pc-1")
+        raw = queue.get_task(task["id"])
+        raw["leaseExpiresAt"] = "2000-01-01T00:00:00+00:00"
+        queue._save_task(raw)
+        with self.assertRaises(queue.TaskConflict):
+            queue.report_task_error(
+                task["id"],
+                agent_name="pc-1",
+                error_code="CARD_READ_FAILED",
+                message="超时",
+                retryable=True,
+                reported_at="2026-10-29T13:24:33+08:00",
+            )
+
+        queue.mark_failed(task["id"], "lease expired")
+        uploaded, _ = queue.create_task({"flow": "export"})
+        queue.claim_next(agent_name="pc-1")
+        queue.save_uploads(uploaded["id"], [("a.pdf", PDF)], agent_name="pc-1")
+        with self.assertRaises(queue.TaskConflict):
+            queue.report_task_error(
+                uploaded["id"],
+                agent_name="pc-1",
+                error_code="CARD_READ_FAILED",
+                message="已上传",
+                retryable=True,
+                reported_at="2026-10-29T13:24:33+08:00",
+            )
+
 
 class CustomsTaskHttpTests(unittest.TestCase):
     def setUp(self):
@@ -168,6 +249,73 @@ class CustomsTaskHttpTests(unittest.TestCase):
             json={"flow": "both"},
         )
         self.assertEqual(denied.status_code, 403)
+
+    def test_report_error_json_without_files(self):
+        created = self.client.post(
+            "/api/customs/tasks",
+            headers={"X-Customs-Task-Token": "create-secret"},
+            json={"flow": "both", "idempotencyKey": "report-error-task"},
+        )
+        task_id = created.json()["taskId"]
+        claimed = self.client.get(
+            "/api/customs/tasks/claim",
+            headers={"Authorization": "Bearer agent-secret", "X-Agent-Name": "pc-1"},
+        )
+        self.assertEqual(claimed.json()["task"]["id"], task_id)
+        payload = {
+            "agentName": "pc-1",
+            "errorCode": "CARD_READ_FAILED",
+            "message": "卡介质未连接或无法读取",
+            "retryable": True,
+            "reportedAt": "2026-10-29T13:24:33+08:00",
+            "details": {"vendorErrorCode": "50070", "phase": "login"},
+        }
+        with patch.object(runner, "start") as start:
+            response = self.client.post(
+                f"/api/customs/tasks/{task_id}/report-error",
+                headers={
+                    "Authorization": "Bearer agent-secret",
+                    "X-Agent-Name": "pc-1",
+                },
+                json=payload,
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["state"], "blocked")
+        self.assertEqual(response.json()["errorCode"], "CARD_READ_FAILED")
+        start.assert_not_called()
+
+        repeated = self.client.post(
+            f"/api/customs/tasks/{task_id}/report-error",
+            headers={
+                "Authorization": "Bearer agent-secret",
+                "X-Agent-Name": "pc-1",
+            },
+            json=payload,
+        )
+        self.assertEqual(repeated.status_code, 200, repeated.text)
+        self.assertEqual(repeated.json()["errorReceivedAt"], response.json()["errorReceivedAt"])
+
+        changed = dict(payload)
+        changed["errorCode"] = "LOGIN_TIMEOUT"
+        conflict = self.client.post(
+            f"/api/customs/tasks/{task_id}/report-error",
+            headers={
+                "Authorization": "Bearer agent-secret",
+                "X-Agent-Name": "pc-1",
+            },
+            json=changed,
+        )
+        self.assertEqual(conflict.status_code, 409)
+
+        mismatch = self.client.post(
+            f"/api/customs/tasks/{task_id}/report-error",
+            headers={
+                "Authorization": "Bearer agent-secret",
+                "X-Agent-Name": "pc-2",
+            },
+            json=payload,
+        )
+        self.assertEqual(mismatch.status_code, 403)
 
 
 class CustomsTaskRunnerTests(unittest.TestCase):
