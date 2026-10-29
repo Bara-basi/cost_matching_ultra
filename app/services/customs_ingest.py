@@ -1507,8 +1507,10 @@ def write_backfill_to_cost_table(
                 len((record.get("fields") or {}).get("pdf原件") or [])
                 for record in records
             ]
-            if attachments[:1] != [1] or any(attachments[1:]):
-                problems.append(f"{declaration}: PDF 未仅附在第一条目标行")
+            if sum(attachments) != 1:
+                problems.append(
+                    f"{declaration}: PDF 应仅附在一条目标行，实际 {sum(attachments)} 个"
+                )
 
         if not problems:
             record_ids = [
