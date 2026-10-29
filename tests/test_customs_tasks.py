@@ -171,6 +171,54 @@ class CustomsTaskHttpTests(unittest.TestCase):
 
 
 class CustomsTaskRunnerTests(unittest.TestCase):
+    def test_runner_writes_to_formal_ai_table(self):
+        from app.services.customs_ingest import WriteSummary
+
+        with tempfile.TemporaryDirectory() as temp:
+            tasks_dir = Path(temp) / "tasks"
+            with patch.object(queue, "TASKS_DIR", tasks_dir):
+                task, _ = queue.create_task({"flow": "export"})
+                queue.claim_next(agent_name="pc-1")
+                queue.save_uploads(task["id"], [("a.pdf", PDF)], agent_name="pc-1")
+
+                def fake_parse(_pdfs, path):
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(b"xlsx")
+                    return {"rows": 1, "failed": []}
+
+                def fake_split(_parse, split_dir):
+                    split_dir.mkdir(parents=True, exist_ok=True)
+                    (split_dir / "拆单明细_全部.xlsx").write_bytes(b"xlsx")
+                    return {"stats": {}}
+
+                summary = WriteSummary(
+                    marker="test",
+                    declarations=["722020260000439783"],
+                    sourceRecords=0,
+                    aiRecords=1,
+                    uploadedFiles=1,
+                    workDir=str(tasks_dir / task["id"] / "work"),
+                    mode="original-ai-fields-only",
+                )
+                with patch.object(runner.pipeline, "parse_pdfs", side_effect=fake_parse), \
+                     patch.object(runner.pipeline, "run_round", side_effect=fake_split), \
+                     patch.object(
+                         runner.pipeline,
+                         "review_rows",
+                         return_value=[{"报关单号": "722020260000439783"}],
+                     ), \
+                     patch(
+                         "app.services.customs_ingest.build_records",
+                         return_value=([], [{"报关单号": "722020260000439783"}], {}),
+                     ), \
+                     patch(
+                         "app.services.customs_ingest.write_to_original",
+                         return_value=summary,
+                     ) as writer:
+                    runner._process(task["id"])
+                self.assertTrue(writer.called)
+                self.assertEqual(writer.call_args.kwargs["declarations"], ["722020260000439783"])
+
     def test_runner_completes_and_clears_pdf_cache(self):
         with tempfile.TemporaryDirectory() as temp:
             tasks_dir = Path(temp) / "tasks"

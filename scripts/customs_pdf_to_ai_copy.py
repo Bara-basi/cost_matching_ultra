@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--declarations", default="", help="逗号分隔的报关单号；留空自动选择多拆记录")
     parser.add_argument("--limit", type=int, default=3)
     parser.add_argument("--apply", action="store_true", help="实际写飞书；不加只生成计划")
-    parser.add_argument("--target", choices=("copy", "original"), default="copy")
+    parser.add_argument("--target", choices=("copy", "original"), default="original")
     parser.add_argument(
         "--verify-existing",
         action="store_true",

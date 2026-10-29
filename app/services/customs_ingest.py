@@ -1181,7 +1181,7 @@ def write_to_copy_ai_fields(
     marker: str,
     wait_seconds: int = 60,
 ) -> WriteSummary:
-    """任务链默认写回飞书副本表，并允许按需创建 AI 字段。"""
+    """显式写回飞书副本表，供副本联调使用；正式任务链写原表。"""
     return write_to_original(
         declarations=declarations,
         source_rows=source_rows,

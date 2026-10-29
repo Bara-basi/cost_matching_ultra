@@ -1,4 +1,4 @@
-"""执行财务电脑上传的报关 PDF：解析、拆单、成本匹配并写回飞书副本。"""
+"""执行财务电脑上传的报关 PDF：解析、拆单、成本匹配并写回正式 AI 表。"""
 from __future__ import annotations
 
 import json
@@ -69,7 +69,7 @@ def _process(task_id: str) -> dict[str, Any]:
     if not declarations:
         raise ValueError("拆单结果中没有报关单号")
 
-    from app.services.customs_ingest import build_records, write_to_copy_ai_fields
+    from app.services.customs_ingest import build_records, write_to_original
 
     marker = f"飞书任务-{task_id}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     source_rows, ai_rows, declaration_pdfs = build_records(
@@ -79,8 +79,8 @@ def _process(task_id: str) -> dict[str, Any]:
         uploads,
         marker,
     )
-    customs_task_queue.update_processing(task_id, progress=76, message="正在写回飞书副本")
-    summary = write_to_copy_ai_fields(
+    customs_task_queue.update_processing(task_id, progress=76, message="正在写回正式 AI 表")
+    summary = write_to_original(
         declarations=declarations,
         source_rows=source_rows,
         ai_rows=ai_rows,
@@ -91,7 +91,7 @@ def _process(task_id: str) -> dict[str, Any]:
     )
     write_summary = asdict(summary)
     write_summary["workDir"] = "(任务结束后已清理)"
-    write_detail_path = work_dir / "copy_ai_write_result.json"
+    write_detail_path = work_dir / "original_ai_write_result.json"
     result = {
         "taskId": task_id,
         "declarations": declarations,
