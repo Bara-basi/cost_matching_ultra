@@ -37,6 +37,9 @@ class McpClient:
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
             "Authorization": f"Bearer {self.token}",
+            # 2025-06-18 Streamable HTTP transport requires this header after
+            # initialization; some ERP gateways started enforcing it in 2026-10.
+            "MCP-Protocol-Version": "2025-06-18",
         }
         if self.session:
             headers["Mcp-Session-Id"] = self.session

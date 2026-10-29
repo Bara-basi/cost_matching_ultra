@@ -301,6 +301,21 @@ class WorkbenchTests(unittest.TestCase):
                 [{"orderId": "2"}, {"orderId": "3"}]]):
             self.assertEqual([row["orderId"] for row in fetch_list(session, SALE_ORDERS, pause=0)], ["1", "2", "3"])
 
+    def test_single_remote_count_drift_is_accepted_only_at_duplicate_tail(self):
+        from scripts.erp_fetch_all import fetch_list
+        from app.services.erp_lists import SALE_ORDERS
+        from unittest.mock import Mock
+        session = Mock()
+        session.fetch_json.return_value = {"root": "test", "total": 5}
+        with patch("app.services.erp_replay.columns_to_rows", side_effect=[
+                [{"orderId": "1"}, {"orderId": "2"}],
+                [{"orderId": "3"}, {"orderId": "4"}],
+                [{"orderId": "4"}]]):
+            self.assertEqual(
+                [row["orderId"] for row in fetch_list(session, SALE_ORDERS, pause=0)],
+                ["1", "2", "3", "4"],
+            )
+
     def test_list_totals_row_does_not_end_pagination_early(self):
         from scripts.erp_fetch_all import fetch_list
         from app.services.erp_lists import PURCHASES

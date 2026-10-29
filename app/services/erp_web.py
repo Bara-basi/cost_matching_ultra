@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any, Callable
 
@@ -31,12 +32,56 @@ def erp_credentials() -> tuple[str, str]:
     return user, password
 
 
+def chromium_executables() -> list[Path]:
+    """返回可用的 Chromium/Chrome 可执行文件，优先显式配置。"""
+    candidates: list[Path] = []
+    configured = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE", "").strip()
+    if configured:
+        candidates.append(Path(configured))
+    if sys.platform.startswith("linux"):
+        cache = Path.home() / ".cache" / "ms-playwright"
+        candidates.extend(
+            sorted(cache.glob("chromium-*/chrome-linux64/chrome"), reverse=True)
+        )
+        candidates.extend(
+            Path(path)
+            for path in (
+                "/usr/bin/chromium",
+                "/usr/bin/chromium-browser",
+                "/usr/bin/google-chrome",
+                "/usr/bin/google-chrome-stable",
+            )
+        )
+    elif sys.platform.startswith("win"):
+        for base in (os.environ.get("PROGRAMFILES"), os.environ.get("PROGRAMFILES(X86)")):
+            if base:
+                candidates.append(
+                    Path(base) / "Google" / "Chrome" / "Application" / "chrome.exe"
+                )
+    return [path for path in candidates if path.is_file()]
+
+
 def launch_browser(playwright, headless: bool = True):
-    """优先用 Playwright 自带 Chromium，其次本机 Chrome。"""
+    """优先用 Playwright 默认浏览器，再回退到本机或缓存的 Chromium。"""
     try:
         return playwright.chromium.launch(headless=headless)
     except Exception:  # noqa: BLE001
+        pass
+    errors: list[str] = []
+    for executable in chromium_executables():
+        try:
+            return playwright.chromium.launch(
+                headless=headless,
+                executable_path=str(executable),
+                args=["--no-sandbox"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{executable}: {exc}")
+    try:
         return playwright.chromium.launch(headless=headless, channel="chrome")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"channel=chrome: {exc}")
+    raise RuntimeError("无法启动 Chromium：" + "；".join(errors))
 
 
 def login(page) -> None:

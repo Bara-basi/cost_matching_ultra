@@ -43,6 +43,7 @@ def fetch_list(session: ErpSession, spec, *, max_pages: int = 1000, pause: float
     page = 1
     expected_total = 0
     fetched_count = 0
+    duplicate_tail = False
     while page <= max_pages:
         query = dict(spec.base_query)
         query[spec.page_param] = page
@@ -88,6 +89,12 @@ def fetch_list(session: ErpSession, spec, *, max_pages: int = 1000, pause: float
             flush=True,
         )
         if page > 1 and added == 0:
+            # ERP 偶发把已删除/不可见记录计入 total。最后一页只重复
+            # 上一页且唯一记录仅少 1 条时，把它视为分页尾部边界；
+            # 任何更大的缺口仍按不完整列表拒绝提交。
+            if expected_total and len(rows) >= expected_total - 1:
+                duplicate_tail = True
+                break
             raise RuntimeError(f"{spec.name} 第 {page} 页完全重复，分页没有推进")
         if total and len(rows) >= total:
             break
@@ -95,7 +102,8 @@ def fetch_list(session: ErpSession, spec, *, max_pages: int = 1000, pause: float
             break
         page += 1
         time.sleep(pause)
-    if (expected_total and len(rows) < expected_total) or page > max_pages:
+    missing = expected_total - len(rows) if expected_total else 0
+    if (missing > 0 and not (duplicate_tail and missing == 1)) or page > max_pages:
         raise RuntimeError(f"{spec.name} 列表未抓齐：已获取 {fetched_count} 条原始行（去重后 {len(rows)}），远端总数 {expected_total}，未写入不完整列表")
     return rows
 
