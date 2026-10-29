@@ -448,7 +448,33 @@ def write_direct_to_ai_copy(
 def _records_for_declarations(client: FeishuClient, app: str, table: str, declarations: list[str]) -> dict[str, list[dict]]:
     out: dict[str, list[dict]] = {value: [] for value in declarations}
     wanted = set(declarations)
-    for record in client.iter_records(app, table):
+    records: list[dict] = []
+    for start in range(0, len(declarations), 10):
+        chunk = declarations[start : start + 10]
+        records.extend(
+            client.search_records(
+                app,
+                table,
+                {
+                    "conjunction": "or",
+                    "conditions": [
+                        {
+                            "field_name": "报关单号",
+                            "operator": "is",
+                            "value": [declaration],
+                        }
+                        for declaration in chunk
+                    ],
+                },
+            )
+        )
+    seen: set[str] = set()
+    for record in records:
+        record_id = str(record.get("record_id") or "")
+        if record_id and record_id in seen:
+            continue
+        if record_id:
+            seen.add(record_id)
         fields = record.get("fields") or {}
         declaration = _first_text(fields.get("报关单号"))
         if declaration in wanted:
@@ -1219,6 +1245,8 @@ def _match_desired_records(
     for index, row in enumerate(desired_rows):
         amount = decimal_value(row.get("报关金额"))
         weight = decimal_value(row.get("报关重量"))
+        cost = decimal_value(row.get("采购金额"))
+        basis = str(row.get("分摊依据") or "").strip()
         supplier = str(row.get("供应商") or "").strip()
         product = str(row.get("产品类型") or "").strip()
 
@@ -1246,7 +1274,32 @@ def _match_desired_records(
             )
             == weight
         ]
-        choice = exact[0] if len(exact) == 1 else candidates[0] if len(candidates) == 1 else None
+        refined = [
+            record
+            for record in exact
+            if decimal_value(_record_value(record, "采购金额AI")) == cost
+        ]
+        if len(refined) > 1:
+            basis_matches = [
+                record
+                for record in refined
+                if _first_text(_record_value(record, "采购金额分摊依据AI")) == basis
+            ]
+            if basis_matches:
+                refined = basis_matches
+        if refined:
+            choice = sorted(
+                refined,
+                key=lambda record: str(record.get("record_id") or ""),
+            )[0]
+        else:
+            choice = (
+                exact[0]
+                if len(exact) == 1
+                else candidates[0]
+                if len(candidates) == 1
+                else None
+            )
 
         if choice is None:
             exact_any = [
@@ -1267,6 +1320,18 @@ def _match_desired_records(
             ]
             if len(exact_any) == 1:
                 choice = exact_any[0]
+            elif exact_any:
+                refined_any = [
+                    record
+                    for record in exact_any
+                    if decimal_value(_record_value(record, "采购金额AI")) == cost
+                    and _first_text(_record_value(record, "采购金额分摊依据AI")) == basis
+                ]
+                if refined_any:
+                    choice = sorted(
+                        refined_any,
+                        key=lambda record: str(record.get("record_id") or ""),
+                    )[0]
 
         if choice is None and index == 0:
             empty_keys = [

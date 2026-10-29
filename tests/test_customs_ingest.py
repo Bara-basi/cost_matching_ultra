@@ -108,6 +108,47 @@ class CustomsIngestTests(unittest.TestCase):
         matched = _match_desired_records(desired, records)
         self.assertEqual([record["record_id"] for record in matched], ["R1", "R2"])
 
+    def test_duplicate_business_key_uses_cost_and_basis(self):
+        desired = [
+            {
+                "报关单号": "D1",
+                "供应商": "供应商甲",
+                "产品类型": "法兰",
+                "报关金额": "100",
+                "报关重量": "10",
+                "采购金额": "80",
+                "分摊依据": "A",
+            },
+            {
+                "报关单号": "D1",
+                "供应商": "供应商甲",
+                "产品类型": "法兰",
+                "报关金额": "100",
+                "报关重量": "10",
+                "采购金额": "20",
+                "分摊依据": "B",
+            },
+        ]
+
+        def record(record_id, cost, basis):
+            return {
+                "record_id": record_id,
+                "fields": {
+                    "供应商": [{"text": "供应商甲"}],
+                    "产品类型(对内)": [{"text": "法兰"}],
+                    "报关金额AI": 100,
+                    "报关重量AI": 10,
+                    "采购金额AI": cost,
+                    "采购金额分摊依据AI": basis,
+                },
+            }
+
+        matched = _match_desired_records(
+            desired,
+            [record("R20", 20, "B"), record("R80", 80, "A")],
+        )
+        self.assertEqual([item["record_id"] for item in matched], ["R80", "R20"])
+
     def test_all_result_fields_get_ai_columns(self):
         class FakeClient:
             def __init__(self):
