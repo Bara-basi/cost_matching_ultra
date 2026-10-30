@@ -4,7 +4,10 @@ from __future__ import annotations
 import unittest
 from decimal import Decimal
 
-from app.services.parser.declaration_parser import _declaration_number
+from app.services.parser.declaration_parser import (
+    _declaration_number,
+    _pre_record_dates,
+)
 from app.services.parser.models import DeclarationItem
 from app.services.parser.pre_record_parser import (
     correct_item_quantities,
@@ -38,6 +41,32 @@ class PreRecordParserTests(unittest.TestCase):
         self.assertEqual(
             _declaration_number(lines, "\n".join(lines)),
             "223320260002002667",
+        )
+
+    def test_split_declare_and_export_labels_read_separate_dates_above(self):
+        lines = [
+            "*310120260514502678*",
+            "备案号",
+            "20261021",
+            "申报日期",
+            "20261026",
+            "出口日期",
+            "梅山港区",
+        ]
+        self.assertEqual(
+            _pre_record_dates(lines),
+            ("2026-10-21", "2026-10-26"),
+        )
+
+    def test_combined_date_label_keeps_legacy_behavior(self):
+        lines = [
+            "*310120260514502678*",
+            "2026102120261026",
+            "申报日期出口日期",
+        ]
+        self.assertEqual(
+            _pre_record_dates(lines),
+            ("2026-10-21", "2026-10-26"),
         )
 
     def test_price_relationship_corrects_reversed_text_quantities(self):

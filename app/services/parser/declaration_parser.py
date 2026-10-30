@@ -606,18 +606,26 @@ def _v2_number_before(lines: list[str], label: str) -> str:
     return re.sub(r"[^\d.]", "", value)
 
 
+def _pre_record_dates(lines: list[str]) -> tuple[str, str]:
+    """返回 (申报日期, 出口日期)，兼容合并标签和独立标签两种版式。"""
+    combined = _v2_above(lines, "申报日期出口日期")
+    if re.fullmatch(r"\d{8}", combined or ""):
+        cleaned = _clean_date(combined)
+        return cleaned, cleaned
+    if re.fullmatch(r"\d{16}", combined or ""):
+        return _clean_date(combined[:8]), _clean_date(combined[8:])
+
+    declare_date = _clean_date(_v2_above(lines, "申报日期"))
+    export_date = _clean_date(_v2_above(lines, "出口日期"))
+    return declare_date, export_date
+
+
 def _parse_header_v2(lines: list[str], text: str) -> DeclarationHeader:
     header = DeclarationHeader()
     header.declaration_no = _declaration_number(lines, text)
     header.pre_entry_no = _find_line(text, r"预录入编号[:：]\s*(\d{18})")
     header.contract_raw = _v2_above(lines, "合同协议号")
-    export = _v2_above(lines, "申报日期出口日期")
-    if re.fullmatch(r"\d{8}", export or ""):
-        header.export_date = _clean_date(export)
-        header.declare_date = _clean_date(export)
-    elif re.fullmatch(r"\d{16}", export or ""):
-        header.declare_date = _clean_date(export[:8])
-        header.export_date = _clean_date(export[8:])
+    header.declare_date, header.export_date = _pre_record_dates(lines)
     header.export_port = _strip_code(_v2_above(lines, "离境口岸"))
     header.transport_mode = _v2_above(lines, "运输方式")
     header.trade_mode = _strip_code(_v2_above(lines, "监管方式"))
