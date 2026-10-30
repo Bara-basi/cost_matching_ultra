@@ -340,9 +340,69 @@ def _find_line(text: str, pattern: str) -> str:
     return match.group(1).strip() if match else ""
 
 
+DECLARATION_NUMBER_RE = re.compile(r"(?<!\d)(\d{18})(?!\d)")
+
+
+def _declaration_number(lines: list[str], text: str) -> str:
+    """提取海关编号；兼容预录单中标签靠左、值与标签不相邻的文本顺序。"""
+    starred = re.findall(r"(?m)^\*(\d{18})\*$", text)
+    if starred:
+        return starred[0]
+
+    label_hits = [
+        (index, line.find("海关编号"))
+        for index, line in enumerate(lines)
+        if "海关编号" in line
+    ]
+    for index, label_at in label_hits:
+        line = lines[index]
+        inline_numbers: list[tuple[int, str]] = []
+        for match in DECLARATION_NUMBER_RE.finditer(line):
+            distance = (
+                match.start() - label_at
+                if match.start() >= label_at
+                else label_at - match.end()
+            )
+            inline_numbers.append((distance, match.group(1)))
+        if inline_numbers:
+            return min(inline_numbers, key=lambda item: item[0])[1]
+
+        # 新预录单可能先输出左侧整列标签，再输出右侧整列值。
+        # 在标签附近按距离查找 18 位纯数字，而不是要求同一行紧邻。
+        nearby: list[tuple[int, int, int, str]] = []
+        for offset in range(1, 31):
+            for candidate_index in (index - offset, index + offset):
+                if not 0 <= candidate_index < len(lines):
+                    continue
+                match = DECLARATION_NUMBER_RE.search(lines[candidate_index])
+                if match:
+                    direction = 0 if candidate_index > index else 1
+                    nearby.append(
+                        (direction, offset, candidate_index, match.group(1))
+                    )
+        if nearby:
+            return min(nearby, key=lambda item: item[:3])[3]
+
+    # 某些预录单不再输出“仅供核对用”或首行星号，只能从表头候选中取号。
+    header_end = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if line.startswith("商品序号 商品编号") or ITEM_V2_RE.match(line.strip())
+        ),
+        len(lines),
+    )
+    for line in lines[:header_end]:
+        match = DECLARATION_NUMBER_RE.search(line)
+        if match:
+            return match.group(1)
+    match = DECLARATION_NUMBER_RE.search(text)
+    return match.group(1) if match else ""
+
+
 def _parse_header(lines: list[str], text: str) -> DeclarationHeader:
     header = DeclarationHeader()
-    header.declaration_no = _find_line(text, r"海关编号[:：]\s*(\d{12,20})")
+    header.declaration_no = _declaration_number(lines, text)
     header.pre_entry_no = _find_line(text, r"预录入编号[:：]\s*([A-Za-z0-9]{8,24})")
     header.contract_raw = _contract_after(lines)
 
@@ -548,9 +608,7 @@ def _v2_number_before(lines: list[str], label: str) -> str:
 
 def _parse_header_v2(lines: list[str], text: str) -> DeclarationHeader:
     header = DeclarationHeader()
-    header.declaration_no = _find_line(text, r"^\*?(\d{18})\*?$")
-    if not header.declaration_no:
-        header.declaration_no = _find_line(text, r"(\d{18})")
+    header.declaration_no = _declaration_number(lines, text)
     header.pre_entry_no = _find_line(text, r"预录入编号[:：]\s*(\d{18})")
     header.contract_raw = _v2_above(lines, "合同协议号")
     export = _v2_above(lines, "申报日期出口日期")

@@ -4,6 +4,7 @@ from __future__ import annotations
 import unittest
 from decimal import Decimal
 
+from app.services.parser.declaration_parser import _declaration_number
 from app.services.parser.models import DeclarationItem
 from app.services.parser.pre_record_parser import (
     correct_item_quantities,
@@ -12,6 +13,33 @@ from app.services.parser.pre_record_parser import (
 
 
 class PreRecordParserTests(unittest.TestCase):
+    def test_left_column_customs_number_is_read_when_value_is_not_adjacent(self):
+        lines = [
+            "预录入编号：E20260001865115627",
+            "境内发货人(913304017964830942)",
+            "海关编号",
+            "境外收货人",
+            "223120260004677495",
+            "合同协议号",
+            "26MT-10B365Y",
+        ]
+        self.assertEqual(
+            _declaration_number(lines, "\n".join(lines)),
+            "223120260004677495",
+        )
+
+    def test_customs_number_prefers_forward_value_over_unrelated_number_above(self):
+        lines = [
+            "913304017964830942",
+            "海关编号",
+            *(["其他左侧字段"] * 10),
+            "223320260002002667",
+        ]
+        self.assertEqual(
+            _declaration_number(lines, "\n".join(lines)),
+            "223320260002002667",
+        )
+
     def test_price_relationship_corrects_reversed_text_quantities(self):
         text = """
         47.5千克
