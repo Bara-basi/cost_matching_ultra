@@ -21,7 +21,7 @@ from app.services import erp_sync, lookup, workspace
 from app.services.feishu_client import get_config
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-APP_VERSION = "2026.10.29-cost-ai.4"
+APP_VERSION = "2026.10.30-cost-ai.6"
 
 app = FastAPI(title="成本匹配工作台", version=APP_VERSION)
 WEB_DIST = PROJECT_ROOT / "web" / "dist"
@@ -155,6 +155,7 @@ def _startup() -> None:
     workspace.recover_interrupted()
     from app.services import customs_tasks as customs_task_queue, customs_task_runner
 
+    customs_task_queue.ensure_fixed_test_task()
     customs_task_queue.recover_interrupted()
     customs_task_runner.resume_uploaded()
     # 定时全量同步：启动时按需跑一次 + 后台每 12 小时一轮（可用环境变量调整）
@@ -308,7 +309,7 @@ async def upload_customs_task_files(
     x_agent_name: str = Header(""),
     authorization: str = Header(""),
 ) -> dict:
-    """上传本任务的全部 PDF；保存成功后立即启动成本匹配 AI 表写回。"""
+    """上传完整 PDF，解析后返回按上传顺序排列的财务文件命名映射。"""
     _require_customs_agent_token(authorization)
     from app.services import customs_tasks as customs_task_queue, customs_task_runner
 
@@ -332,11 +333,52 @@ async def upload_customs_task_files(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     customs_task_runner.start(task_id)
-    return {
+    naming = await run_in_threadpool(
+        customs_task_runner.wait_for_document_names, task_id
+    )
+    task = customs_task_queue.get_task(task_id)
+    response = {
         "taskId": task["id"],
         "state": task["state"],
         "fileCount": task["fileCount"],
+        "documentNamesReady": naming is not None,
         "statusUrl": f"/api/customs/tasks/{task['id']}",
+        "documentNamesUrl": f"/api/customs/tasks/{task['id']}/document-names",
+    }
+    if task.get("summary") is not None:
+        response["summary"] = task["summary"]
+    if naming is not None:
+        response.update(
+            {
+                "orderBasis": naming.get("orderBasis"),
+                "documents": naming.get("documents") or [],
+                "documentNames": naming.get("documentNames") or [],
+                "nameMap": naming.get("nameMap") or {},
+            }
+        )
+    return response
+
+
+@app.get("/api/customs/tasks/{task_id}/document-names")
+def get_customs_task_document_names(
+    task_id: str, authorization: str = Header("")
+) -> dict:
+    """查询解析后的文件名；供上传响应等待超时后补取。"""
+    _require_customs_agent_token(authorization)
+    from app.services import customs_tasks as customs_task_queue, customs_task_runner
+
+    task = customs_task_queue.get_task(task_id)
+    naming = customs_task_runner.document_names(task_id)
+    if naming is None:
+        return {
+            "taskId": task["id"],
+            "state": task.get("state"),
+            "documentNamesReady": False,
+        }
+    return {
+        **naming,
+        "state": task.get("state"),
+        "documentNamesReady": True,
     }
 
 

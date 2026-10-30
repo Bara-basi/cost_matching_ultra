@@ -63,12 +63,25 @@ class CustomsTaskQueueTests(unittest.TestCase):
 
         uploaded = queue.save_uploads(
             task["id"],
-            [("../declaration.pdf", PDF)],
+            [("../z-declaration.pdf", PDF), ("a-declaration.pdf", PDF)],
             agent_name="pc-1",
         )
         self.assertEqual(uploaded["state"], "uploaded")
-        self.assertEqual(uploaded["fileCount"], 1)
-        self.assertTrue((self.root / "tasks" / task["id"] / "uploads" / "declaration.pdf").exists())
+        self.assertEqual(uploaded["fileCount"], 2)
+        self.assertTrue((self.root / "tasks" / task["id"] / "uploads" / "z-declaration.pdf").exists())
+        self.assertEqual(
+            [item["storedFileName"] for item in queue.ordered_upload_entries(task["id"])],
+            ["z-declaration.pdf", "a-declaration.pdf"],
+        )
+        manifest = queue.upload_manifest(task["id"])
+        self.assertEqual(
+            manifest["orderBasis"],
+            "multipart-files-field-received-order",
+        )
+        self.assertEqual(
+            [item["originalFileName"] for item in manifest["files"]],
+            ["z-declaration.pdf", "a-declaration.pdf"],
+        )
 
         queue.mark_processing(task["id"])
         queue.mark_completed(task["id"], {"aiRecords": 1})
@@ -76,6 +89,7 @@ class CustomsTaskQueueTests(unittest.TestCase):
         task_dir = self.root / "tasks" / task["id"]
         self.assertFalse((task_dir / "uploads").exists())
         self.assertTrue((task_dir / "task.json").exists())
+        self.assertTrue((task_dir / "upload_manifest.json").exists())
 
     def test_processing_task_recovers_with_existing_pdf(self):
         task, _ = queue.create_task({"flow": "export"})
@@ -84,6 +98,37 @@ class CustomsTaskQueueTests(unittest.TestCase):
         queue.mark_processing(task["id"])
         self.assertEqual(queue.recover_interrupted(), [task["id"]])
         self.assertEqual(queue.get_task(task["id"])["state"], "uploaded")
+
+    def test_fixed_test_task_skips_claim_and_is_reusable(self):
+        fixed = queue.ensure_fixed_test_task()
+        self.assertEqual(fixed["id"], queue.FIXED_TEST_TASK_ID)
+        self.assertEqual(fixed["source"], "test")
+        self.assertTrue(fixed["fixedTestTask"])
+        self.assertIsNone(queue.claim_next(agent_name="pc-1"))
+
+        first = queue.save_uploads(
+            fixed["id"], [("a.pdf", PDF)], agent_name="pc-1"
+        )
+        self.assertEqual(first["state"], "uploaded")
+        queue.mark_processing(fixed["id"])
+        queue.mark_completed(fixed["id"], {"mode": "test-parse-only"})
+        self.assertEqual(
+            queue.get_task(fixed["id"])["message"],
+            "报关单解析和文件命名完成，测试任务结束",
+        )
+
+        second = queue.save_uploads(
+            fixed["id"], [("b.pdf", PDF)], agent_name="pc-2"
+        )
+        self.assertEqual(second["state"], "uploaded")
+        self.assertNotIn("summary", second)
+        self.assertEqual(
+            [
+                item["storedFileName"]
+                for item in queue.ordered_upload_entries(fixed["id"])
+            ],
+            ["b.pdf"],
+        )
 
     def test_new_queued_task_wins_over_expired_claim(self):
         stale, _ = queue.create_task({"flow": "export"})
@@ -234,6 +279,7 @@ class CustomsTaskHttpTests(unittest.TestCase):
             )
         self.assertEqual(uploaded.status_code, 202, uploaded.text)
         start.assert_called_once_with(task_id)
+        self.assertFalse(uploaded.json()["documentNamesReady"])
 
         status = self.client.get(
             f"/api/customs/tasks/{task_id}",
@@ -241,6 +287,139 @@ class CustomsTaskHttpTests(unittest.TestCase):
         )
         self.assertEqual(status.status_code, 200, status.text)
         self.assertEqual(status.json()["state"], "uploaded")
+
+    def test_upload_returns_renames_in_received_order(self):
+        created = self.client.post(
+            "/api/customs/tasks",
+            headers={"X-Customs-Task-Token": "create-secret"},
+            json={"flow": "export", "idempotencyKey": "rename-order"},
+        )
+        task_id = created.json()["taskId"]
+        self.client.get(
+            "/api/customs/tasks/claim",
+            headers={"Authorization": "Bearer agent-secret", "X-Agent-Name": "pc-1"},
+        )
+        naming = {
+            "orderBasis": "multipart-files-field-received-order",
+            "documents": [
+                {
+                    "index": 1,
+                    "originalFileName": "z.pdf",
+                    "storedFileName": "z.pdf",
+                    "newFileName": "202610_26MT-01A100_8477.pdf",
+                },
+                {
+                    "index": 2,
+                    "originalFileName": "a.pdf",
+                    "storedFileName": "a.pdf",
+                    "newFileName": "202611_26MT-02B200_9999.pdf",
+                },
+            ],
+            "documentNames": [
+                "202610_26MT-01A100_8477.pdf",
+                "202611_26MT-02B200_9999.pdf",
+            ],
+            "nameMap": {
+                "z.pdf": "202610_26MT-01A100_8477.pdf",
+                "a.pdf": "202611_26MT-02B200_9999.pdf",
+            },
+        }
+        with patch.object(runner, "start"), patch.object(
+            runner, "wait_for_document_names", return_value=naming
+        ):
+            uploaded = self.client.post(
+                f"/api/customs/tasks/{task_id}/upload",
+                headers={"Authorization": "Bearer agent-secret"},
+                data={"agent_name": "pc-1"},
+                files=[
+                    ("files", ("z.pdf", PDF, "application/pdf")),
+                    ("files", ("a.pdf", PDF, "application/pdf")),
+                ],
+            )
+        self.assertEqual(uploaded.status_code, 202, uploaded.text)
+        self.assertTrue(uploaded.json()["documentNamesReady"])
+        self.assertEqual(
+            uploaded.json()["documentNames"],
+            [
+                "202610_26MT-01A100_8477.pdf",
+                "202611_26MT-02B200_9999.pdf",
+            ],
+        )
+        self.assertEqual(
+            uploaded.json()["nameMap"]["z.pdf"],
+            "202610_26MT-01A100_8477.pdf",
+        )
+        with patch.object(runner, "document_names", return_value=naming):
+            fetched = self.client.get(
+                f"/api/customs/tasks/{task_id}/document-names",
+                headers={"Authorization": "Bearer agent-secret"},
+            )
+        self.assertEqual(fetched.status_code, 200, fetched.text)
+        self.assertTrue(fetched.json()["documentNamesReady"])
+        self.assertEqual(fetched.json()["nameMap"], naming["nameMap"])
+
+        denied = self.client.get(
+            f"/api/customs/tasks/{task_id}/document-names",
+            headers={"Authorization": "Bearer wrong"},
+        )
+        self.assertEqual(denied.status_code, 403)
+
+    def test_fixed_task_upload_without_claim_finishes_after_parse(self):
+        fixed = queue.ensure_fixed_test_task()
+        task_id = fixed["id"]
+        self.assertEqual(
+            queue.get_task(task_id)["state"],
+            "queued",
+        )
+
+        def fake_parse(_pdfs, path):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"xlsx")
+            return {"rows": 1, "failed": []}
+
+        naming = {
+            "orderBasis": "multipart-files-field-received-order",
+            "documents": [
+                {
+                    "index": 1,
+                    "originalFileName": "a.pdf",
+                    "storedFileName": "a.pdf",
+                    "newFileName": "202610_26MT-01A100_8477.pdf",
+                    "monthDateField": "出口日期",
+                    "error": None,
+                }
+            ],
+            "documentNames": ["202610_26MT-01A100_8477.pdf"],
+            "nameMap": {"a.pdf": "202610_26MT-01A100_8477.pdf"},
+            "declarations": ["2231202600008477"],
+        }
+        with patch.object(runner.pipeline, "parse_pdfs", side_effect=fake_parse), \
+             patch.object(runner, "build_document_names", return_value=naming), \
+             patch.object(
+                 runner.pipeline,
+                 "run_round",
+                 side_effect=AssertionError("test task must not split"),
+             ):
+            uploaded = self.client.post(
+                f"/api/customs/tasks/{task_id}/upload",
+                headers={"Authorization": "Bearer agent-secret"},
+                data={"agent_name": "pc-1"},
+                files={"files": ("a.pdf", PDF, "application/pdf")},
+            )
+
+        self.assertEqual(uploaded.status_code, 202, uploaded.text)
+        self.assertEqual(uploaded.json()["state"], "completed")
+        self.assertEqual(
+            uploaded.json()["documentNames"],
+            ["202610_26MT-01A100_8477.pdf"],
+        )
+        self.assertEqual(uploaded.json()["summary"]["mode"], "test-parse-only")
+        task = queue.get_task(task_id)
+        self.assertEqual(task["state"], "completed")
+        self.assertEqual(task["source"], "test")
+        self.assertTrue(task["fixedTestTask"])
+        self.assertEqual(task["summary"]["mode"], "test-parse-only")
+        self.assertEqual(task["summary"]["aiRecords"], 0)
 
     def test_url_verification_and_auth_failure(self):
         verified = self.client.post(
@@ -330,6 +509,66 @@ class CustomsTaskHttpTests(unittest.TestCase):
 
 
 class CustomsTaskRunnerTests(unittest.TestCase):
+    def test_document_names_follow_upload_order_and_finance_format(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            parse_xlsx = root / "parse.xlsx"
+            parse_xlsx.write_bytes(b"fixture")
+            entries = [
+                {
+                    "index": 1,
+                    "originalFileName": "z-download.pdf",
+                    "storedFileName": "z-download.pdf",
+                },
+                {
+                    "index": 2,
+                    "originalFileName": "a-download.pdf",
+                    "storedFileName": "a-download.pdf",
+                },
+            ]
+            rows = [
+                {
+                    "来源文件": "a-download.pdf",
+                    "出口日期": "2026-11-02",
+                    "合同号_1": "26MT-02B200",
+                    "报关单号": "2231202600009999",
+                },
+                {
+                    "来源文件": "z-download.pdf",
+                    "出口日期": None,
+                    "申报日期": "2026-10-03",
+                    "合同号_1": "26MT-01A100",
+                    "报关单号": "2231202600008477",
+                },
+            ]
+            with patch(
+                "app.services.customs_ingest.read_sheet", return_value=rows
+            ):
+                naming = runner.build_document_names(
+                    "ct_0123456789abcdef",
+                    parse_xlsx,
+                    entries,
+                    {"failed": []},
+                )
+        self.assertEqual(
+            naming["documentNames"],
+            [
+                "202610_26MT-01A100_8477.pdf",
+                "202611_26MT-02B200_9999.pdf",
+            ],
+        )
+        self.assertEqual(
+            [item["originalFileName"] for item in naming["documents"]],
+            ["z-download.pdf", "a-download.pdf"],
+        )
+        self.assertEqual(
+            naming["nameMap"],
+            {
+                "z-download.pdf": "202610_26MT-01A100_8477.pdf",
+                "a-download.pdf": "202611_26MT-02B200_9999.pdf",
+            },
+        )
+
     def test_runner_writes_to_formal_ai_table(self):
         from app.services.customs_ingest import WriteSummary
 
@@ -361,6 +600,16 @@ class CustomsTaskRunnerTests(unittest.TestCase):
                 )
                 with patch.object(runner.pipeline, "parse_pdfs", side_effect=fake_parse), \
                      patch.object(runner.pipeline, "run_round", side_effect=fake_split), \
+                     patch.object(
+                         runner,
+                         "build_document_names",
+                         return_value={
+                             "documentNames": ["202610_26MT-01A100_8477.pdf"],
+                             "nameMap": {
+                                 "a.pdf": "202610_26MT-01A100_8477.pdf"
+                             },
+                         },
+                     ), \
                      patch.object(
                          runner.pipeline,
                          "review_rows",

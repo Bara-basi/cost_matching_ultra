@@ -21,6 +21,11 @@ MAX_FILE_BYTES = int(get_config("CUSTOMS_MAX_PDF_MB", "20")) * 1024 * 1024
 MAX_TOTAL_BYTES = int(get_config("CUSTOMS_MAX_TOTAL_MB", "500")) * 1024 * 1024
 DEFAULT_LEASE_SECONDS = int(get_config("CUSTOMS_AGENT_LEASE_SECONDS", "900"))
 TASK_ID_RE = re.compile(r"^ct_[0-9a-f]{16}$")
+FIXED_TEST_TASK_ID = str(
+    get_config("CUSTOMS_FIXED_TEST_TASK_ID", "ct_49e8dc49d0ce48c1")
+).strip()
+if not TASK_ID_RE.fullmatch(FIXED_TEST_TASK_ID):
+    raise ValueError("CUSTOMS_FIXED_TEST_TASK_ID 必须是 ct_ 加 16 位十六进制")
 
 _LOCK = threading.RLock()
 
@@ -63,6 +68,73 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
         encoding="utf-8",
     )
     os.replace(temporary, path)
+
+
+def upload_manifest(task_id: str) -> dict[str, Any] | None:
+    """返回上传时按 multipart 文件字段接收顺序落盘的清单。"""
+    path = _task_dir(task_id) / "upload_manifest.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def ordered_upload_entries(task_id: str) -> list[dict[str, Any]]:
+    """按上传原始顺序返回文件；兼容没有新版清单的旧任务。"""
+    manifest = upload_manifest(task_id)
+    if manifest and isinstance(manifest.get("files"), list):
+        return [
+            item
+            for item in manifest["files"]
+            if isinstance(item, dict) and item.get("storedFileName")
+        ]
+    task = get_task(task_id)
+    return [
+        item
+        for item in task.get("files") or []
+        if isinstance(item, dict) and item.get("name")
+    ]
+
+
+def is_fixed_test_task(task_id: str) -> bool:
+    return task_id == FIXED_TEST_TASK_ID
+
+
+def ensure_fixed_test_task() -> dict[str, Any]:
+    """确保固定测试 taskid 存在，并由财务电脑主动上传而非进入领取队列。"""
+    with _LOCK:
+        path = _task_path(FIXED_TEST_TASK_ID)
+        task = _read_task(path)
+        if task is None:
+            task = {
+                "id": FIXED_TEST_TASK_ID,
+                "state": "queued",
+                "createdAt": _now(),
+                "updatedAt": _now(),
+                "requestedBy": "finance-agent",
+                "source": "test",
+                "fixedTestTask": True,
+                "idempotencyKey": "fixed-finance-agent-parse-test",
+                "parameters": {
+                    "source": "test",
+                    "workflow": "customs",
+                    "flow": "both",
+                    "startDate": "",
+                    "endDate": "",
+                    "declarations": [],
+                    "contracts": [],
+                },
+                "progress": 0,
+                "message": "固定解析测试任务，等待财务电脑主动上传",
+                "history": [],
+            }
+            return _save_task(task, "fixed-test-created")
+        if task.get("source") != "test" or not task.get("fixedTestTask"):
+            task["source"] = "test"
+            task["fixedTestTask"] = True
+            return _save_task(task, "fixed-test-repaired")
+        return task
 
 
 def _read_task(path: Path) -> dict[str, Any] | None:
@@ -218,6 +290,8 @@ def claim_next(*, agent_name: str, lease_seconds: int = DEFAULT_LEASE_SECONDS) -
     with _LOCK:
         candidates: list[tuple[int, dict[str, Any]]] = []
         for task in _all_tasks():
+            if task.get("id") == FIXED_TEST_TASK_ID:
+                continue
             state = task.get("state")
             eligible = state == "queued"
             if state == "claimed":
@@ -385,12 +459,15 @@ def save_uploads(
 
     with _LOCK:
         task = get_task(task_id)
-        if task.get("state") in {"processing", "completed"}:
+        fixed_test = is_fixed_test_task(task_id)
+        if task.get("state") == "processing":
+            raise TaskConflict("任务正在处理，不能重复上传")
+        if not fixed_test and task.get("state") == "completed":
             raise TaskConflict("任务已进入处理阶段或已完成")
-        if task.get("state") not in {"claimed", "uploaded"}:
+        if not fixed_test and task.get("state") not in {"claimed", "uploaded"}:
             raise TaskConflict("任务尚未被财务电脑领取")
         owner = str(task.get("agentName") or "")
-        if owner and owner != agent_name:
+        if not fixed_test and owner and owner != agent_name:
             raise TaskConflict("任务已由其他财务电脑领取")
 
         task_dir = _task_dir(task_id)
@@ -401,7 +478,8 @@ def save_uploads(
         try:
             total = 0
             for index, (raw_name, content) in enumerate(files, 1):
-                safe_name = Path(str(raw_name).replace("\\", "/")).name
+                original_name = Path(str(raw_name).replace("\\", "/")).name
+                safe_name = original_name
                 if not safe_name.lower().endswith(".pdf"):
                     raise ValueError(f"{safe_name or f'第{index}个文件'} 不是 PDF")
                 if len(content) > MAX_FILE_BYTES:
@@ -414,6 +492,9 @@ def save_uploads(
                 total += len(content)
                 manifest.append(
                     {
+                        "index": index,
+                        "originalFileName": original_name,
+                        "storedFileName": name,
                         "name": name,
                         "bytes": len(content),
                         "sha256": hashlib.sha256(content).hexdigest(),
@@ -425,6 +506,35 @@ def save_uploads(
             if uploads.exists():
                 shutil.rmtree(uploads)
             os.replace(staging, uploads)
+            _atomic_json(
+                task_dir / "upload_manifest.json",
+                {
+                    "taskId": task_id,
+                    "orderBasis": "multipart-files-field-received-order",
+                    "files": manifest,
+                },
+            )
+            (task_dir / "document_names.json").unlink(missing_ok=True)
+            if fixed_test:
+                (task_dir / "result.json").unlink(missing_ok=True)
+                work = task_dir / "work"
+                if work.exists():
+                    shutil.rmtree(work)
+                for key in (
+                    "completedAt",
+                    "failedAt",
+                    "blockedAt",
+                    "error",
+                    "errorCode",
+                    "errorMessage",
+                    "errorRetryable",
+                    "errorReportedAt",
+                    "errorReceivedAt",
+                    "errorAgentName",
+                    "errorDetails",
+                    "summary",
+                ):
+                    task.pop(key, None)
         except Exception:
             shutil.rmtree(staging, ignore_errors=True)
             raise
@@ -435,8 +545,13 @@ def save_uploads(
                 "uploadedAt": _now(),
                 "fileCount": len(manifest),
                 "files": manifest,
+                "fixedTestTask": fixed_test,
                 "progress": 3,
-                "message": "PDF 已上传，等待服务器核算",
+                "message": (
+                    "PDF 已上传，开始解析测试任务"
+                    if fixed_test
+                    else "PDF 已上传，等待服务器核算"
+                ),
             }
         )
         return _save_task(task, "uploaded", {"fileCount": len(manifest)})
@@ -474,11 +589,16 @@ def update_processing(
 def mark_completed(task_id: str, summary: dict[str, Any]) -> dict[str, Any]:
     with _LOCK:
         task = get_task(task_id)
+        message = (
+            "报关单解析和文件命名完成，测试任务结束"
+            if summary.get("mode") == "test-parse-only"
+            else "成本匹配 AI 表写回完成"
+        )
         task.update(
             {
                 "state": "completed",
                 "progress": 100,
-                "message": "成本匹配 AI 表写回完成",
+                "message": message,
                 "completedAt": _now(),
                 "summary": summary,
             }
