@@ -262,7 +262,7 @@ onUnmounted(() => { clearInterval(timer); cancelAnimationFrame(frame); cancelAni
       <div class="sidebar-label">工作区</div>
       <nav aria-label="主导航"><button v-for="item in nav" :key="item.id" class="nav-item" :class="{ active: screen === item.id }" @click="screen = item.id; if(item.id === 'jobs') loadJobs(); if(item.id === 'exceptions') loadExceptions()"><span class="nav-icon">{{ item.icon }}</span>{{ item.label }}<span v-if="item.id === 'jobs' && jobs.length" class="nav-count">{{ jobs.length }}</span></button></nav>
     </aside>
-    <main class="main" :class="{ 'sync-complete': screen === 'result' && job?.kind === 'sync' && job?.state === 'complete' }">
+    <main class="main" :class="{ 'result-complete': screen === 'result' && job?.state === 'complete' }">
       <header class="topbar"><div class="crumb">财务运营 <span>/</span> {{ screen === 'result' ? '任务结果' : screen === 'queue' ? '任务概览' : nav.find(n => n.id === screen)?.label }}</div><div class="top-actions"><button class="icon-button" @click="switchTheme" :title="theme === 'dark' ? '切换白天模式' : '切换夜间模式'">{{ theme === 'dark' ? '☀' : '☾' }}</button></div></header>
       <div class="content">
         <section v-if="screen === 'home'" class="page-enter">
