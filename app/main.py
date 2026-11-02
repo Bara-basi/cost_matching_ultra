@@ -755,6 +755,7 @@ async def sync_scan(
     declarations: str = Form(""),
     contracts: str = Form(""),
     limit: int = Form(50),
+    include_accounted: bool = Form(False),
 ) -> dict:
     from app.services import feishu_workflow
     from app.services.feishu_client import FeishuError
@@ -764,6 +765,7 @@ async def sync_scan(
         return feishu_workflow.start_scan(
             start_date=start_date, end_date=end_date,
             declarations=declarations, contracts=contracts, limit=limit,
+            include_accounted=include_accounted,
         )
     except (FeishuError, urllib.error.URLError) as exc:
         raise HTTPException(status_code=503, detail=f"飞书读取暂不可用：{exc}") from exc
@@ -774,14 +776,15 @@ async def sync_scan(
 @app.post("/api/sync/preview")
 async def sync_preview(
     start_date: str = Form(""), end_date: str = Form(""), declarations: str = Form(""),
-    contracts: str = Form(""), limit: int = Form(50),
+    contracts: str = Form(""), limit: int = Form(50), include_accounted: bool = Form(False),
 ) -> dict:
     from app.services import feishu_workflow
     from app.services.feishu_client import FeishuError
     import urllib.error
     try:
         result = feishu_workflow.select_records(start_date=start_date, end_date=end_date,
-                                                declarations=declarations, contracts=contracts, limit=limit)
+                                                declarations=declarations, contracts=contracts, limit=limit,
+                                                include_accounted=include_accounted)
     except (FeishuError, urllib.error.URLError) as exc:
         raise HTTPException(status_code=503, detail=f"飞书读取暂不可用：{exc}") from exc
     except ValueError as exc:

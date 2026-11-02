@@ -53,3 +53,7 @@
 .flag-inline{flex:none;margin:0 13px 0 4px;padding:8px 10px;border:1px solid color-mix(in srgb,var(--red) 35%,transparent);border-radius:8px;background:var(--red-pale);color:var(--red);font-size:10px;font-weight:700;white-space:nowrap;transition:transform .18s,background .18s}
 .flag-inline:hover{transform:scale(1.05);background:color-mix(in srgb,var(--red-pale) 80%,var(--red))}
 @media(max-width:590px){.flag-inline{margin-right:7px;padding:6px;font-size:9px}}
+
+.sync-complete .page-enter>.notice.amber,.sync-complete .page-enter>.notice.red{display:none}
+.scope-toggle{display:flex;align-items:center;gap:4px;grid-column:1/-1;order:-1;min-height:42px;margin:0;padding:0 12px;border:1px solid var(--line);border-radius:9px;background:var(--paper-soft);cursor:pointer}
+.scope-toggle input{accent-color:var(--brand)}

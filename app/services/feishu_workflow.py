@@ -1,4 +1,4 @@
-"""从飞书副本商品行筛选未核算输入，并保守地规划拆单写回。"""
+"""从飞书副本商品行筛选待核算或指定已核算输入，并保守地规划拆单写回。"""
 from __future__ import annotations
 
 import hashlib
@@ -116,7 +116,8 @@ def _merge_group_totals(items):
     return merge_group_totals(items)
 
 
-def select_records(*, start_date="", end_date="", declarations="", contracts="", limit=50):
+def select_records(*, start_date="", end_date="", declarations="", contracts="",
+                   limit=50, include_accounted=False):
     for value in (start_date, end_date):
         if value:
             try:
@@ -129,7 +130,7 @@ def select_records(*, start_date="", end_date="", declarations="", contracts="",
         raise ValueError("单批上限应为 1 至 200")
     client, app, table = _target()
     wanted_decl, wanted_contract = _tokens(declarations), _tokens(contracts)
-    conditions = [_condition("采购金额", "isEmpty", [])]
+    conditions = [] if include_accounted else [_condition("采购金额", "isEmpty", [])]
     if start_date:
         conditions.append(_date_filter("出口日期", start_date, True))
     if end_date:
@@ -146,7 +147,10 @@ def select_records(*, start_date="", end_date="", declarations="", contracts="",
                     for value in sorted(wanted_contract))
     else:
         searches = iter(({"conjunction": "and", "conditions": conditions},))
-    candidates = itertools.chain.from_iterable(client.iter_search_records(app, table, query) for query in searches)
+    if conditions or wanted_decl or wanted_contract:
+        candidates = itertools.chain.from_iterable(client.iter_search_records(app, table, query) for query in searches)
+    else:
+        candidates = client.iter_records(app, table)
     selected, skipped = [], []
     scanned = 0
     seen_candidates = set()
@@ -165,7 +169,9 @@ def select_records(*, start_date="", end_date="", declarations="", contracts="",
             date = _date(fields.get("出口日期"))
             if not date or (start_date and date < start_date) or (end_date and date > end_date):
                 continue
-        if _text(fields.get(META_SOURCE)) or _text(fields.get("采购金额")):
+        if _text(fields.get(META_SOURCE)):
+            continue
+        if not include_accounted and _text(fields.get("采购金额")):
             continue
         item = _record_input(record)
         reason = _input_reason(item)
@@ -246,7 +252,7 @@ def select_records(*, start_date="", end_date="", declarations="", contracts="",
             reason = _input_reason(item)
             if not reason:
                 item["contextOnly"] = True
-                item["writebackBlocked"] = "同合同补齐记录仅用于计算，不属于所选未核算区间"
+                item["writebackBlocked"] = "同合同补齐记录仅用于计算，不属于所选核算区间"
                 context.append(item)
             else:
                 skipped.append({"record_id": record["record_id"],
@@ -286,7 +292,8 @@ def select_records(*, start_date="", end_date="", declarations="", contracts="",
 def start_scan(**filters):
     chosen = select_records(**filters)
     if not chosen["selected"]:
-        return {"id": None, "selection": chosen["selection"], "message": "所选范围内没有可处理的未核算商品行。"}
+        target = "商品行" if filters.get("include_accounted") else "未核算商品行"
+        return {"id": None, "selection": chosen["selection"], "message": f"所选范围内没有可处理的{target}。"}
     sources = chosen["selected"] + chosen["context"]
     declarations = [{"来源文件": "飞书副本商品行", **source, "总价": source["报关金额"]}
                     for source in sources]

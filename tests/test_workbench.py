@@ -361,7 +361,7 @@ class WorkbenchTests(unittest.TestCase):
             self.assertEqual(client.call_text("purchase.find", {}), "")
             self.assertEqual(request.call_count, 3)
 
-    def test_lookup_incomplete_input_rejects_before_split_without_fetching_context(self):
+    def test_lookup_incomplete_batch_is_reported_without_aborting_the_job(self):
         rows = [{"报关单号": "223120260000174064", "合同号_1": "26MT-01A001",
                  "报关品名": "钢管", "总价": "100", "币种": "USD"}]
         with tempfile.TemporaryDirectory() as directory, \
@@ -374,14 +374,58 @@ class WorkbenchTests(unittest.TestCase):
             workspace._update("incomplete", id="incomplete", kind="lookup", state="queued")
             workspace._run_active("incomplete", "lookup", [], rows, False)
             status = workspace.get_job("incomplete")
-            self.assertEqual(status["state"], "failed")
-            self.assertEqual(status["failureReason"], "incomplete_input")
+            self.assertEqual(status["state"], "complete")
+            self.assertEqual(status["batchSummary"]["calculatedBatches"], 0)
+            self.assertEqual(status["batchSummary"]["rejectedBatches"], 1)
             self.assertIn("少 50.00", status["inputErrors"][0]["原因"])
-            self.assertFalse((workspace.JOBS_DIR / "incomplete" / "rows.json").exists())
-            self.assertEqual(TestClient(app).get("/api/jobs/incomplete/rows").status_code, 404)
+            result_rows = workspace.result_rows("incomplete")
+            self.assertEqual(len(result_rows), 1)
+            self.assertTrue(result_rows[0]["_未核算"])
+            self.assertIn("少 50.00", result_rows[0]["异常明细"])
+            self.assertEqual(TestClient(app).get("/api/jobs/incomplete/rows").status_code, 200)
             related.assert_not_called()
             split.assert_not_called()
             costs.assert_not_called()
+
+    def test_lookup_keeps_calculating_complete_batches_when_another_batch_is_incomplete(self):
+        contracts = ["26MT-01A001", "26MT-01A002"]
+        rows = [{"报关单号": str(223120260000174064+i), "合同号_1": contract,
+                 "报关品名": "钢管", "总价": "100", "币种": "USD"}
+                for i, contract in enumerate(contracts)]
+
+        def detail(invoice):
+            return {"baseInfo": {"出运总金额": "150" if invoice.endswith("001") else "100", "币种": "USD"},
+                    "expenseList": []}
+
+        def split(path, out):
+            out.mkdir(parents=True, exist_ok=True)
+            workspace._write_xlsx(workspace._read_sheet(path),
+                                  out / "拆单明细_全部.xlsx",
+                                  list(pipeline.DECLARATION_COLUMNS))
+
+        def costs(path):
+            return [{**row, "采购金额": "80", "异常类型": "正常"} for row in workspace._read_sheet(path)]
+
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(workspace, "JOBS_DIR", Path(directory) / "jobs"), \
+             patch.object(pipeline, "RUNS_DIR", Path(directory) / "runs"), \
+             patch.object(shipment_detail, "shipment_invoices_for_contract", side_effect=lambda code: ["PI-"+code]), \
+             patch.object(shipment_detail, "load_shipment_detail", side_effect=detail), \
+             patch.object(pipeline, "run_round", side_effect=split), \
+             patch.object(pipeline, "review_rows", side_effect=costs):
+            workspace._update("lookup-mixed", id="lookup-mixed", kind="lookup", state="queued")
+            workspace._run_active("lookup-mixed", "lookup", [], rows, False)
+            status = workspace.get_job("lookup-mixed")
+            self.assertEqual(status["state"], "complete")
+            self.assertEqual(status["batchSummary"]["calculatedBatches"], 1)
+            self.assertEqual(status["batchSummary"]["rejectedBatches"], 1)
+            result = workspace.result_rows("lookup-mixed")
+            accepted = [row for row in result if not row.get("_未核算")]
+            rejected = [row for row in result if row.get("_未核算")]
+            self.assertEqual([row["合同号_1"] for row in accepted], [contracts[1]])
+            self.assertEqual(accepted[0]["采购金额"], "80")
+            self.assertEqual([row["合同号_1"] for row in rejected], [contracts[0]])
+            self.assertIn("少 50.00", rejected[0]["异常明细"])
 
     def test_input_completeness_groups_joint_and_individual_contracts_without_double_counting(self):
         mapping = {"26MT-01A001&002": ["PI-26MT-01A001", "PI-26MT-01A002"],
@@ -779,6 +823,10 @@ class WorkbenchTests(unittest.TestCase):
                 yield target
                 yield already  # 防御性本地校验也应排除已核算行
 
+            def iter_records(self, _app, _table):
+                yield target
+                yield already
+
             def search_records(self, _app, _table, filter):
                 if filter["conditions"][0]["field_name"] == "报关单号":
                     return [target]
@@ -793,6 +841,9 @@ class WorkbenchTests(unittest.TestCase):
         self.assertEqual(result["selection"]["supplemental"], 1)
         self.assertIn("isEmpty", [entry["operator"] for entry in fake.candidate_filter["conditions"]])
         self.assertNotIn("pdf原件", [entry["field_name"] for entry in fake.candidate_filter["conditions"]])
+        with patch.object(feishu_workflow, "_target", return_value=(fake, "app", "table")):
+            accounted = feishu_workflow.select_records(limit=5, include_accounted=True)
+        self.assertEqual([item["record_id"] for item in accounted["selected"]], ["target", "already"])
 
     def test_sync_scan_uses_feishu_rows_and_never_downloads_pdf(self):
         source = {"record_id": "source", "报关单号": "223120260000174064",
@@ -852,8 +903,9 @@ class WorkbenchTests(unittest.TestCase):
             response = TestClient(app).post("/api/sync/preview", data={"limit": 1})
         self.assertEqual(response.status_code, 503)
         with patch.object(feishu_workflow, "start_scan", return_value={"id": None, "selection": {}}) as start:
-            response = TestClient(app).post("/api/sync/scan", data={"limit": 1})
+            response = TestClient(app).post("/api/sync/scan", data={"limit": 1, "include_accounted": "true"})
         self.assertEqual(response.status_code, 200)
+        self.assertTrue(start.call_args.kwargs["include_accounted"])
         self.assertNotIn("use_ai", start.call_args.kwargs)
 
     def test_feishu_paste_and_unique_source_enrichment(self):

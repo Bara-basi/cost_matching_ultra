@@ -238,8 +238,8 @@ def _run(job_id: str, kind: str, files: list[Path], declarations: list[dict], us
         _run_active(job_id, kind, files, declarations, use_ai)
 
 
-def _sync_calculation(job_id: str, inputs: list[dict], run_dir: Path, stopped) -> tuple[list[dict], dict]:
-    """飞书按共享出运批次隔离失败，成功批次汇总后统一调用离线成本分摊。"""
+def _batch_calculation(job_id: str, inputs: list[dict], run_dir: Path, stopped) -> tuple[list[dict], dict]:
+    """按共享出运批次隔离失败，成功批次汇总后统一调用离线成本分摊。"""
     from app.services.shipment_detail import shipment_invoices_for_contract, strip_pi
     from app.services.contract_shipments import expand_contract
 
@@ -385,8 +385,8 @@ def _run_active(job_id: str, kind: str, files: list[Path], declarations: list[di
                 input_path.write_text(json.dumps(inputs, ensure_ascii=False, default=str), encoding="utf-8")
             finally:
                 book.close()
-        if kind == "sync":
-            rows, stats = _sync_calculation(job_id, declarations, run_dir, stopped)
+        if kind in ("sync", "lookup"):
+            rows, stats = _batch_calculation(job_id, declarations, run_dir, stopped)
             if halt_if_cancelled():
                 return
         else:
@@ -431,7 +431,7 @@ def _run_active(job_id: str, kind: str, files: list[Path], declarations: list[di
         _update(
             job_id, state="complete", progress=100,
             message=(f"处理完成：{stats['calculatedBatches']} 个批次已核算，{stats['rejectedBatches']} 个批次未核算，请查看异常原因"
-                     if kind == "sync" else "处理完成"), summary=payload,
+                     if kind in ("sync", "lookup") else "处理完成"), summary=payload,
             parse=parse_stats, split=stats,
         )
     except pipeline.BatchCalculationError as exc:
