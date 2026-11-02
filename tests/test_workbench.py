@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 import urllib.error
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
@@ -517,6 +518,28 @@ class WorkbenchTests(unittest.TestCase):
                 self.assertEqual(pipeline.run_round(path, Path(directory) / "split"), {"stats": {"拆出记录": 1}, "supplemented": 0})
                 split.assert_called_once()
                 self.assertEqual(path.read_bytes(), b"unchanged input")
+
+    def test_review_rows_preserve_declaration_currency(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "split.xlsx"
+            workspace._write_xlsx([
+                {"报关单号": "223120260000174064", "合同号_1": "26MT-01A001",
+                 "报关品名": "钢管", "产品类型": "无缝管", "供应商简称": "甲",
+                 "采购单号": "26MT-01A001-HD", "出运金额合计": "100.00",
+                 "出运采购金额合计": "800.00", "报关金额": "100.00",
+                 "币种": "USD", "客户费用分摊": "0.00", "报关重量": "10"}
+            ], path, ["报关单号", "合同号_1", "报关品名", "产品类型", "供应商简称",
+                       "采购单号", "出运金额合计", "出运采购金额合计", "报关金额",
+                       "币种", "客户费用分摊", "报关重量"])
+            with patch.object(review, "allocate_costs", return_value=[
+                    {"amount": Decimal("800.00"), "total": Decimal("800.00"), "basis": ""}
+                ]), \
+                 patch.object(review, "_batch_purchase_totals", return_value={}), \
+                 patch.object(review, "erp_links", return_value=("", "")):
+                rows = review.build_rows(path)
+            self.assertEqual(rows[0]["币种"], "USD")
+            self.assertEqual(rows[0]["报关金额"], "100.00")
+            self.assertEqual(rows[0]["采购金额"], "800.00")
 
     def test_unclaimed_twin_already_costed_is_allowed_but_unaccounted_goods_reject_batch(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1036,7 +1059,7 @@ class WorkbenchTests(unittest.TestCase):
             root.mkdir()
             (root / "source_records.json").write_text(json.dumps([{
                 "record_id": "rec_1", "报关单号": "123", "合同号_1": "MT",
-                "报关品名": "钢管", "报关金额": "100.00"
+                "报关品名": "钢管", "报关金额": "100.00", "币种": "USD"
             }], ensure_ascii=False), encoding="utf-8")
             rows = [
                 {"报关单号": "123", "合同号_1": "MT", "报关品名": "钢管", "采购订单号": "PO1", "供应商简称": "甲",
@@ -1048,6 +1071,7 @@ class WorkbenchTests(unittest.TestCase):
             proposal = feishu_workflow.plan("sample")
             self.assertEqual(proposal["summary"]["ready"], 1)
             self.assertEqual(proposal["groups"][0]["resultAmount"], "100.00")
+            self.assertEqual(proposal["groups"][0]["currency"], "USD")
             self.assertEqual(len(proposal["groups"][0]["children"]), 2)
             rows[1]["报关金额"] = "59.99"
             (root / "rows.json").write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")

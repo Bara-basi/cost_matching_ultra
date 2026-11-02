@@ -1785,6 +1785,7 @@ def run(
                             "出运金额合计": f"{share / 100:.2f}",
                             "出运采购金额合计": f"{sum(line_rmb_cents(x) for x in items + extra_lines) / 100:.2f}",
                             "报关金额": f"{allocated_cents / 100:.2f}",
+                            "币种": str(row.get("currency") or "").strip().upper(),
                             "客户费用分摊": f"{fee_cents / 100:.2f}",
                             "报关重量": fmt_weight(weight_parts[position]),
                             "重量分摊依据": weight_basis,
@@ -2069,7 +2070,7 @@ def run(
     detail_columns = [
         "报关单号", "合同号_1", "报关品名", "海关编码", "产品类型",
         "供应商简称", "供应商", "采购单号", "出运金额合计", "出运采购金额合计",
-        "报关金额", "客户费用分摊", "报关重量", "重量分摊依据", "产品行数", "补记成本",
+        "报关金额", "币种", "客户费用分摊", "报关重量", "重量分摊依据", "产品行数", "补记成本",
     ]
     group_columns = [
         "报关单号", "合同号_1", "报关品名",

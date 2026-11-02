@@ -401,6 +401,7 @@ def plan(job_id):
                        "memberCount": len(source.get("sourceMembers", [source])),
                        "contextOnly": bool(source.get("contextOnly")),
                        "pdfTokens": source.get("pdfTokens", []),
+                       "currency": _text(source.get("币种")),
                        "originalAmount": str(original) if original is not None else "",
                        "resultAmount": f"{total:.2f}", "status": "ready" if not reasons else "blocked",
                        "manualAdjusted": any(child.get("_人工调整") for child in children),
